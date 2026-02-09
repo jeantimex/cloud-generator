@@ -252,6 +252,10 @@ struct VolumeUniforms {
   absorption : f32,
   renderSteps : f32,
   lightSteps : f32,
+  renderMode : f32,
+  padding0 : f32,
+  padding1 : f32,
+  padding2 : f32,
 };
 
 @binding(0) @group(0) var<uniform> volumeUniforms : VolumeUniforms;
@@ -443,40 +447,73 @@ fn fs_volume(@location(0) ndc : vec2<f32>) -> @location(0) vec4<f32> {
 
   let tNear = max(t.x, 0.0);
   let tFar = t.y;
+  let lightDir = normalize(vec3(1.0, 1.0, 0.5));
 
-  // Volumetric raymarching with Beer's Law
-  let numSteps = i32(volumeUniforms.renderSteps);
-  let stepSize = (tFar - tNear) / volumeUniforms.renderSteps;
+  // Surface mode: sphere tracing with normal-based shading
+  if (volumeUniforms.renderMode < 0.5) {
+    var tCurrent = tNear;
+    var hit = false;
+    for (var i = 0; i < 128; i++) {
+      if (tCurrent > tFar) { break; }
+      let p = rayOrigin + rayDir * tCurrent;
+      let d = cloudSDF(p);
+      if (d < 0.001) {
+        hit = true;
+        break;
+      }
+      tCurrent += max(d, 0.005);
+    }
+
+    if (!hit) {
+      return vec4(0.0, 0.0, 0.0, 0.0);
+    }
+
+    let hitPos = rayOrigin + rayDir * tCurrent;
+    let normal = calcNormal(hitPos);
+    let diffuse = max(dot(normal, lightDir), 0.0);
+    let ambient = 0.3;
+    let shade = ambient + diffuse * 0.7;
+    return vec4(vec3(shade), 1.0);
+  }
+
+  // Volume mode: adaptive raymarching with Beer's Law
+  let maxSteps = i32(volumeUniforms.renderSteps);
+  let denseStepSize = (tFar - tNear) / volumeUniforms.renderSteps;
   let absorption = volumeUniforms.absorption;
 
   var transmittance = 1.0;
   var accColor = vec3(0.0);
-  let lightDir = normalize(vec3(1.0, 1.0, 0.5));
   let cloudColor = vec3(1.0, 1.0, 1.0);
 
-  for (var i = 0; i < numSteps; i++) {
-    if (transmittance < 0.01) { break; }
+  var tCurrent = tNear;
+  for (var i = 0; i < maxSteps; i++) {
+    if (tCurrent > tFar || transmittance < 0.01) { break; }
 
-    let tCurrent = tNear + (f32(i) + 0.5) * stepSize;
     let pos = rayOrigin + rayDir * tCurrent;
-    let density = sampleDensity(pos);
+    let sdfDist = cloudSDF(pos);
 
+    // If far from surface, skip ahead using SDF distance
+    if (sdfDist > denseStepSize * 2.0) {
+      tCurrent += sdfDist * 0.8;
+      continue;
+    }
+
+    // Inside or near cloud: sample density and accumulate
+    let density = smoothstep(0.1, -0.1, sdfDist);
     if (density > 0.001) {
-      // Beer's Law: light attenuates exponentially through dense material
-      let attenuation = exp(-density * stepSize * absorption);
-
-      // Light marching: how much light reaches this point from the sun
+      let attenuation = exp(-density * denseStepSize * absorption);
       let lightTransmittance = lightMarch(pos, lightDir, absorption);
 
-      // Combine ambient + directional light
       let ambient = 0.3;
       let directional = lightTransmittance * 0.7;
       let luminance = ambient + directional;
       let shade = luminance * cloudColor;
 
-      accColor += shade * density * stepSize * absorption * transmittance;
+      accColor += shade * density * denseStepSize * absorption * transmittance;
       transmittance *= attenuation;
     }
+
+    tCurrent += denseStepSize;
   }
 
   let alpha = 1.0 - transmittance;
@@ -651,9 +688,9 @@ async function init() {
     },
   });
 
-  // Volume uniform buffer: 160 bytes (see VolumeUniforms struct)
+  // Volume uniform buffer: 176 bytes (see VolumeUniforms struct)
   const volumeUniformBuffer = device.createBuffer({
-    size: 160,
+    size: 176,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
@@ -731,6 +768,7 @@ async function init() {
     absorption: 5.0,
     renderSteps: 64,
     lightSteps: 6,
+    renderMode: 'Volume',
     blendMode: 'Sharp',
     smoothness: 0.3,
   };
@@ -788,6 +826,7 @@ async function init() {
   noiseFolder.add(params, 'coverage', -0.5, 0.5, 0.01).name('Coverage');
 
   const lightingFolder = gui.addFolder('Lighting');
+  lightingFolder.add(params, 'renderMode', ['Surface', 'Volume']).name('Render Mode');
   lightingFolder.add(params, 'absorption', 1.0, 20.0, 0.5).name('Absorption');
   lightingFolder.add(params, 'renderSteps', 16, 128, 1).name('Render Steps');
   lightingFolder.add(params, 'lightSteps', 1, 16, 1).name('Light Steps');
@@ -870,6 +909,9 @@ async function init() {
     device.queue.writeBuffer(volumeUniformBuffer, 128, new Float32Array([
       params.wispyScale, params.wispyStrength, params.coverage, params.zPadding,
       params.flipZ ? 1.0 : 0.0, params.absorption, params.renderSteps, params.lightSteps,
+    ]));
+    device.queue.writeBuffer(volumeUniformBuffer, 160, new Float32Array([
+      params.renderMode === 'Volume' ? 1.0 : 0.0, 0.0, 0.0, 0.0,
     ]));
 
     const commandEncoder = device.createCommandEncoder();

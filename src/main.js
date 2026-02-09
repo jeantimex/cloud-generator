@@ -12,41 +12,16 @@ function createRNG(seed) {
   };
 }
 
-function generateCloudSpheres(options = {}) {
+function replicateSpheres(baseSpheres, rng, options = {}) {
   const {
-    gridX = 4,
-    gridZ = 4,
-    pointSeparation = 0.25,
-    flattenBottom = -0.3,
-    seed = 42,
     replicationIterations = 2,
     childrenPerSphere = 4,
     keepProbability = 0.5,
     scaleMult = 0.55,
   } = options;
 
-  const rng = createRNG(seed);
-  const spheres = [];
+  const spheres = [...baseSpheres];
 
-  // Phase 2b: Grid generation with jitter
-  const halfX = (gridX - 1) * pointSeparation / 2;
-  const halfZ = (gridZ - 1) * pointSeparation / 2;
-
-  for (let ix = 0; ix < gridX; ix++) {
-    for (let iz = 0; iz < gridZ; iz++) {
-      let x = ix * pointSeparation - halfX + (rng() * 2 - 1) * pointSeparation;
-      let y = (rng() * 2 - 1) * pointSeparation;
-      let z = iz * pointSeparation - halfZ + (rng() * 2 - 1) * pointSeparation;
-
-      // Flatten bottom
-      if (y < flattenBottom) y = flattenBottom;
-
-      const radius = pointSeparation * (0.90 + rng() * 0.52); // 0.90–1.42
-      spheres.push(x, y, z, radius);
-    }
-  }
-
-  // Phase 2c: Sphere replication
   let prevStart = 0;
   let prevCount = spheres.length / 4;
 
@@ -60,7 +35,6 @@ function generateCloudSpheres(options = {}) {
       for (let c = 0; c < childrenPerSphere; c++) {
         if (rng() > keepProbability) continue;
 
-        // Uniform random direction on sphere surface
         const u = rng() * 2 - 1;
         const theta = rng() * Math.PI * 2;
         const sinPhi = Math.sqrt(1 - u * u);
@@ -80,6 +54,115 @@ function generateCloudSpheres(options = {}) {
   }
 
   return new Float32Array(spheres);
+}
+
+function generateCumulus(options = {}) {
+  const {
+    gridX = 4,
+    gridZ = 4,
+    pointSeparation = 0.25,
+    flattenBottom = -0.3,
+    seed = 42,
+  } = options;
+
+  const rng = createRNG(seed);
+  const spheres = [];
+
+  const halfX = (gridX - 1) * pointSeparation / 2;
+  const halfZ = (gridZ - 1) * pointSeparation / 2;
+
+  for (let ix = 0; ix < gridX; ix++) {
+    for (let iz = 0; iz < gridZ; iz++) {
+      let x = ix * pointSeparation - halfX + (rng() * 2 - 1) * pointSeparation;
+      let y = (rng() * 2 - 1) * pointSeparation;
+      let z = iz * pointSeparation - halfZ + (rng() * 2 - 1) * pointSeparation;
+
+      if (y < flattenBottom) y = flattenBottom;
+
+      const radius = pointSeparation * (0.90 + rng() * 0.52);
+      spheres.push(x, y, z, radius);
+    }
+  }
+
+  return replicateSpheres(spheres, rng);
+}
+
+function generateWispy(options = {}) {
+  const { seed = 42 } = options;
+  const rng = createRNG(seed);
+  const spheres = [];
+
+  // S-curve backbone control points
+  const controlPoints = [
+    [-0.8,  0.0,  0.0],
+    [-0.5,  0.1,  0.15],
+    [-0.2, -0.05, -0.1],
+    [ 0.1,  0.1,  0.2],
+    [ 0.3, -0.05, -0.05],
+    [ 0.55, 0.05,  0.1],
+    [ 0.8,  0.0,  -0.1],
+  ];
+
+  const numSpheres = 14;
+  for (let i = 0; i < numSpheres; i++) {
+    const t = i / (numSpheres - 1);
+    // Interpolate along the polyline
+    const segFloat = t * (controlPoints.length - 1);
+    const seg = Math.min(Math.floor(segFloat), controlPoints.length - 2);
+    const frac = segFloat - seg;
+    const p0 = controlPoints[seg];
+    const p1 = controlPoints[seg + 1];
+
+    const x = p0[0] + (p1[0] - p0[0]) * frac + (rng() * 2 - 1) * 0.04;
+    const y = p0[1] + (p1[1] - p0[1]) * frac + (rng() * 2 - 1) * 0.04;
+    const z = p0[2] + (p1[2] - p0[2]) * frac + (rng() * 2 - 1) * 0.04;
+
+    // Sine profile: thicker in middle, thinner at ends
+    const radius = 0.12 + 0.14 * Math.sin(t * Math.PI);
+    spheres.push(x, y, z, radius);
+  }
+
+  return replicateSpheres(spheres, rng, {
+    replicationIterations: 1,
+    childrenPerSphere: 3,
+    keepProbability: 0.6,
+    scaleMult: 0.5,
+  });
+}
+
+function generateEllipsoid(options = {}) {
+  const { seed = 42 } = options;
+  const rng = createRNG(seed);
+  const spheres = [];
+
+  const rx = 0.7, ry = 0.5, rz = 0.6;
+  const step = 0.2;
+
+  for (let x = -rx; x <= rx; x += step) {
+    for (let y = -ry; y <= ry; y += step) {
+      for (let z = -rz; z <= rz; z += step) {
+        const d = (x / rx) ** 2 + (y / ry) ** 2 + (z / rz) ** 2;
+        if (d > 1.0) continue;
+
+        // Radius proportional to distance from surface + jitter
+        const distFromSurface = 1.0 - Math.sqrt(d);
+        const radius = 0.08 + distFromSurface * 0.12 + rng() * 0.04;
+        spheres.push(
+          x + (rng() * 2 - 1) * 0.03,
+          y + (rng() * 2 - 1) * 0.03,
+          z + (rng() * 2 - 1) * 0.03,
+          radius,
+        );
+      }
+    }
+  }
+
+  return replicateSpheres(spheres, rng, {
+    replicationIterations: 1,
+    childrenPerSphere: 3,
+    keepProbability: 0.5,
+    scaleMult: 0.5,
+  });
 }
 
 const shaderCode = `
@@ -428,24 +511,42 @@ async function init() {
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
-  // Generate cloud spheres (Phase 2b grid + Phase 2c replication)
-  const sphereData = generateCloudSpheres();
-  const sphereCount = sphereData.length / 4;
-  console.log(`Generated ${sphereCount} spheres`);
+  // Generate cloud spheres
+  let sphereData = generateCumulus();
+  let sphereCount = sphereData.length / 4;
+  console.log(`[Cumulus] Generated ${sphereCount} spheres`);
 
-  const sphereBuffer = device.createBuffer({
+  let sphereBuffer = device.createBuffer({
     size: sphereData.byteLength,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
   device.queue.writeBuffer(sphereBuffer, 0, sphereData);
 
-  const volumeBindGroup = device.createBindGroup({
+  let volumeBindGroup = device.createBindGroup({
     layout: volumePipeline.getBindGroupLayout(0),
     entries: [
       { binding: 0, resource: { buffer: volumeUniformBuffer } },
       { binding: 1, resource: { buffer: sphereBuffer } },
     ],
   });
+
+  function rebuildSpheres(data) {
+    sphereBuffer.destroy();
+    sphereData = data;
+    sphereCount = data.length / 4;
+    sphereBuffer = device.createBuffer({
+      size: data.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(sphereBuffer, 0, data);
+    volumeBindGroup = device.createBindGroup({
+      layout: volumePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: volumeUniformBuffer } },
+        { binding: 1, resource: { buffer: sphereBuffer } },
+      ],
+    });
+  }
 
   const viewProjectionMatrix = mat4.create();
   const inverseViewProjectionMatrix = mat4.create();
@@ -455,11 +556,23 @@ async function init() {
   const modelViewProjectionMatrix = mat4.create();
 
   // GUI
+  const generators = {
+    Cumulus: generateCumulus,
+    Wispy: generateWispy,
+    Ellipsoid: generateEllipsoid,
+  };
+
   const params = {
+    shape: 'Cumulus',
     blendMode: 'Sharp',
     smoothness: 0.3,
   };
   const gui = new GUI();
+  gui.add(params, 'shape', ['Cumulus', 'Wispy', 'Ellipsoid']).name('Shape').onChange((value) => {
+    const data = generators[value]();
+    rebuildSpheres(data);
+    console.log(`[${value}] Generated ${sphereCount} spheres`);
+  });
   gui.add(params, 'blendMode', ['Sharp', 'Smooth']).name('Blend Mode');
   gui.add(params, 'smoothness', 0.05, 1.0, 0.01).name('Smoothness');
 

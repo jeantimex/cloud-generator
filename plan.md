@@ -171,61 +171,60 @@ From `blender_shader_dump_props.json`, we can mirror the exact node settings:
 ### Phase 2: Cloud Shape
 
 #### 2a. GPU Sphere SDF Foundation
-- [ ] Implement `sphereSDF(p, center, radius)` in WGSL.
+- [x] Implement `sphereSDF(p, center, radius)` in WGSL.
   > *Outcome:* A helper function `sphereSDF(p, center, radius) -> f32` returns the signed distance from point `p` to a sphere surface. Negative inside, positive outside.
-- [ ] Implement `smin(a, b, k)` (polynomial smooth-min) for blending sphere SDFs.
+- [x] Implement `smin(a, b, k)` (polynomial smooth-min) for blending sphere SDFs.
   > *Outcome:* A polynomial smooth-min function that blends two SDF values with smoothness factor `k`. Where two spheres overlap, their surfaces merge into a smooth organic join instead of a hard intersection.
-- [ ] Create a `cloudSDF(p)` function that loops over a storage buffer of spheres
+- [x] Create a `cloudSDF(p)` function that loops over a storage buffer of spheres
       and returns the smooth-union of all sphere distances.
   > *Outcome:* `cloudSDF(p)` iterates over all spheres in the storage buffer, calling `sphereSDF` for each and accumulating with `smin`. Returns a single blended distance value representing the entire cloud shape.
-- [ ] Create the storage buffer + bind group for sphere data (`vec4[]`: xyz=center, w=radius).
+- [x] Create the storage buffer + bind group for sphere data (`vec4[]`: xyz=center, w=radius).
   > *Outcome:* A GPU storage buffer holds an array of `vec4` (xyz = center, w = radius). A separate uniform holds `sphereCount`. Both are bound to the volume pipeline via a new bind group entry.
-- [ ] Upload a few hand-placed test spheres and visualize the SDF in the raymarcher.
+- [x] Upload a few hand-placed test spheres and visualize the SDF in the raymarcher.
   > *Outcome:* 3–5 test spheres at hand-picked positions (e.g. one at origin, others offset) with varying radii. The raymarcher's `sampleDensity` now calls `cloudSDF` instead of the hardcoded single sphere.
 
 > **Phase 2a Expected Outcome:** The single hardcoded sphere is replaced by 3–5 hand-placed test spheres of varying sizes that smoothly blend into each other via `smin`. The result looks like an organic, blobby mass — overlapping spheres merge seamlessly without visible seams. Sphere data is driven by a GPU storage buffer, not hardcoded in the shader.
 
 #### 2b. CPU Sphere Generator (mirrors Blender `AL_CloudCreator_Generator`)
-- [ ] **Grid generation:** Create a 2D grid of points along two axes
+- [x] **Grid generation:** Create a 2D grid of points along two axes
       (`length × width`), spaced by `pointSeparation`.
   > *Outcome:* A JavaScript function generates a flat 2D grid of `(x, z)` positions. For example, `length=5, width=3, pointSeparation=0.3` produces a 5×3 grid of evenly spaced points in the XZ plane.
-- [ ] **Random jitter:** Offset each point by `random[-1,1]³ × pointSeparation`
+- [x] **Random jitter:** Offset each point by `random[-1,1]³ × pointSeparation`
       (seeded RNG for reproducibility).
   > *Outcome:* Each grid point is displaced randomly in X, Y, and Z by up to `±pointSeparation`. A seeded PRNG ensures the same seed always produces the same layout.
-- [ ] **Flatten bottom:** Clamp Z values below a configurable threshold.
+- [x] **Flatten bottom:** Clamp Z values below a configurable threshold.
   > *Outcome:* Any sphere whose Y coordinate falls below the `flattenBottom` threshold has its Y clamped to that value, producing a flat base.
-- [ ] **Assign radius:** `pointSeparation × randomUniform(0.90, 1.42)` per sphere.
+- [x] **Assign radius:** `pointSeparation × randomUniform(0.90, 1.42)` per sphere.
   > *Outcome:* Each sphere gets a radius of `pointSeparation * random(0.90, 1.42)`, so neighboring spheres vary slightly in size for natural irregularity.
-- [ ] **Upload & verify:** Push sphere array to GPU, confirm cloud blob renders.
+- [x] **Upload & verify:** Push sphere array to GPU, confirm cloud blob renders.
   > *Outcome:* The generated sphere array is written to the GPU storage buffer. The raymarcher renders the full set as a single blobby cloud mass inside the wireframe cube.
 
 > **Phase 2b Expected Outcome:** A roughly elliptical cloud blob made of ~20–50 spheres arranged in a jittered grid pattern. The bottom is flat (clamped), the top is rounded. Each sphere has a slightly different radius (0.90–1.42× base), giving the shape natural irregularity. The blob fills roughly half the wireframe cube and reads as a crude cumulus base shape.
 
 #### 2c. Sphere Replication (mirrors Blender Repeat Zone)
-- [ ] **Replication loop** (N iterations, configurable):
+- [x] **Replication loop** (N iterations, configurable):
       For each existing sphere, scatter M child points on its surface
       (uniform random directions at parent radius distance).
   > *Outcome:* Each iteration walks the current sphere list, generates M random directions per sphere, and places child spheres on the parent's surface at those directions. Children are added to the list for the next iteration.
-- [ ] **Shrinking scale:** Child radius = `parentRadius × scaleMult` per iteration.
+- [x] **Shrinking scale:** Child radius = `parentRadius × scaleMult` per iteration.
   > *Outcome:* Each iteration's children are smaller than their parents (e.g. `scaleMult=0.6`). After 3 iterations: base → 60% → 36% → 22% of original radius, creating progressively finer detail.
-- [ ] **Random thinning:** Keep only a fraction of children (probability mask)
+- [x] **Random thinning:** Keep only a fraction of children (probability mask)
       for organic variation.
   > *Outcome:* A `keepProbability` (e.g. 0.5) randomly discards some children each iteration. This prevents exponential blowup and creates irregular, natural-looking gaps in the surface detail.
-- [ ] **Join:** Append child spheres to the master array, re-upload to GPU.
+- [x] **Join:** Append child spheres to the master array, re-upload to GPU.
   > *Outcome:* All spheres (original + all replication passes) are concatenated into one flat array and re-uploaded to the storage buffer. `sphereCount` uniform is updated to the new total.
 
 > **Phase 2c Expected Outcome:** The base cloud blob from 2b now has bumpy, cauliflower-like surface detail. Each replication iteration adds progressively smaller spheres on the surface of existing ones, creating fractal-like organic protrusions. With 2–3 iterations, the sphere count grows to ~200–500. The shape looks noticeably more cloud-like than the smooth blob from 2b — lumpy and irregular with varied scale detail.
 
 #### 2d. Shape Modes
-- [ ] **Mode A — Generate:** Hand-authored `(position, radius)` list for direct sculpting.
-  > *Outcome:* A simple API/data structure where the user provides an explicit array of `{x, y, z, radius}` values. These are uploaded directly to the GPU — full manual control over every sphere.
-- [ ] **Mode B — From Line:** Define a polyline/curve backbone (control points);
-      distribute spheres along it with varying radii (mirrors `AL_CloudCreator_GeneratorCurve`).
-  > *Outcome:* Given an array of 3D control points defining a curve, spheres are distributed at regular intervals along the polyline. Radii can vary along the curve (e.g. thicker in the middle, thinner at ends). Produces elongated cloud shapes like cirrus or stratus.
-- [ ] **Mode C — From Polygon:** Accept an arbitrary 3D mesh, sample points
-      inside its volume (grid fill), place spheres at each sample point with
-      radius proportional to distance-to-surface.
-  > *Outcome:* Given mesh vertex/face data, a 3D grid fills the mesh interior. At each interior grid point, a sphere is placed with radius proportional to distance from the mesh surface (larger deep inside, smaller near edges). Allows cloud shapes that conform to arbitrary silhouettes.
+- [x] **Mode A — Cumulus (Generate):** Grid-based sphere generation with jitter, flatten, and replication (`generateCumulus()`).
+  > *Outcome:* Refactored from `generateCloudSpheres`. Produces a flat-bottomed, puffy cumulus shape via a 2D grid of jittered spheres with 2 replication iterations. Replication logic extracted into reusable `replicateSpheres()` helper.
+- [x] **Mode B — Wispy (From Curve):** Polyline backbone with sine-profile radii (`generateWispy()`).
+  > *Outcome:* 14 spheres placed along a 7-point S-curve polyline with small jitter. Sine profile makes spheres thicker in the middle and thinner at the ends. 1 replication iteration with 3 children produces an elongated wispy cloud.
+- [x] **Mode C — Ellipsoid (From Mesh):** Implicit ellipsoid volume fill (`generateEllipsoid()`).
+  > *Outcome:* 3D grid fill inside an implicit ellipsoid (radii 0.7/0.5/0.6, step 0.2). Sphere radius proportional to distance from surface + jitter. 1 replication iteration produces a dense elliptical cloud mass.
+- [x] **Shape switching:** lil-gui dropdown with `rebuildSpheres()` for live GPU buffer rebuild.
+  > *Outcome:* "Shape" dropdown in GUI switches between Cumulus/Wispy/Ellipsoid. `rebuildSpheres()` destroys old GPU buffer, creates new storage buffer + bind group, updates sphere count. All three modes produce visibly different silhouettes.
 
 > **Phase 2d Expected Outcome:** Three distinct ways to define cloud shapes: (A) manually specify sphere positions/radii for precise control, (B) draw a curve and spheres automatically distribute along it — useful for elongated wispy clouds, (C) provide a mesh and spheres fill its interior — useful for arbitrary shapes. Switching between modes produces visibly different cloud silhouettes while all feeding the same SDF pipeline.
 
@@ -280,12 +279,14 @@ From `blender_shader_dump_props.json`, we can mirror the exact node settings:
 ---
 
 ## 4. Current Task
-- **Next Step:** Implement Phase 1 (Raymarching Engine) — ray-box intersection and
-  basic density visualization inside the cube.
-- **Then:** Phase 2a (Sphere SDF on GPU) — `smin`-blended sphere SDFs via storage buffer.
-- **Then:** Phase 2b (CPU Sphere Generator) — grid + jitter + flatten + radius assignment.
-- **Then:** Phase 2c (Replication) — iterative child sphere scattering.
-- **Then:** Phase 2d (Shape Modes) — line-based and mesh-based sphere placement.
+- [x] ~~Phase 1 (Raymarching Engine) — ray-box intersection and basic density visualization.~~
+- [x] ~~Phase 2a (Sphere SDF on GPU) — `smin`-blended sphere SDFs via storage buffer.~~
+- [x] ~~Phase 2b (CPU Sphere Generator) — grid + jitter + flatten + radius assignment.~~
+- [x] ~~Phase 2c (Replication) — iterative child sphere scattering.~~
+- [x] ~~Phase 2d (Shape Modes) — Cumulus/Wispy/Ellipsoid with lil-gui switching.~~
+- **Next Step:** Phase 2e (Density Gradient) — vertical density falloff (denser bottom, softer top).
+- **Then:** Phase 3 (Noise & Detail) — 3D noise in WGSL, fBm, billowy + wispy noise layers.
+- **Then:** Phase 4 (Lighting & Refinement) — Beer's Law, sun light, directional scattering.
 
 ---
 

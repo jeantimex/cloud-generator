@@ -241,7 +241,13 @@ struct VolumeUniforms {
   gradientTop : f32,
   gradientStrength : f32,
   boxMin : vec3<f32>,
+  billowyScale : f32,
   boxMax : vec3<f32>,
+  billowyStrength : f32,
+  wispyScale : f32,
+  wispyStrength : f32,
+  coverage : f32,
+  padding0 : f32,
 };
 
 @binding(0) @group(0) var<uniform> volumeUniforms : VolumeUniforms;
@@ -289,6 +295,47 @@ fn smin(a : f32, b : f32, k : f32) -> f32 {
   return min(a, b) - h * h * k * 0.25;
 }
 
+// --- 3D Simplex-like noise (hash-based gradient noise) ---
+fn hash33(p : vec3<f32>) -> vec3<f32> {
+  var q = vec3(
+    dot(p, vec3(127.1, 311.7, 74.7)),
+    dot(p, vec3(269.5, 183.3, 246.1)),
+    dot(p, vec3(113.5, 271.9, 124.6)),
+  );
+  return fract(sin(q) * 43758.5453123) * 2.0 - 1.0;
+}
+
+fn noise3D(p : vec3<f32>) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * (3.0 - 2.0 * f);
+
+  return mix(
+    mix(
+      mix(dot(hash33(i + vec3(0.0, 0.0, 0.0)), f - vec3(0.0, 0.0, 0.0)),
+          dot(hash33(i + vec3(1.0, 0.0, 0.0)), f - vec3(1.0, 0.0, 0.0)), u.x),
+      mix(dot(hash33(i + vec3(0.0, 1.0, 0.0)), f - vec3(0.0, 1.0, 0.0)),
+          dot(hash33(i + vec3(1.0, 1.0, 0.0)), f - vec3(1.0, 1.0, 0.0)), u.x), u.y),
+    mix(
+      mix(dot(hash33(i + vec3(0.0, 0.0, 1.0)), f - vec3(0.0, 0.0, 1.0)),
+          dot(hash33(i + vec3(1.0, 0.0, 1.0)), f - vec3(1.0, 0.0, 1.0)), u.x),
+      mix(dot(hash33(i + vec3(0.0, 1.0, 1.0)), f - vec3(0.0, 1.0, 1.0)),
+          dot(hash33(i + vec3(1.0, 1.0, 1.0)), f - vec3(1.0, 1.0, 1.0)), u.x), u.y),
+    u.z);
+}
+
+fn fbm3D(p : vec3<f32>, octaves : i32) -> f32 {
+  var value = 0.0;
+  var amplitude = 0.5;
+  var frequency = 1.0;
+  for (var i = 0; i < octaves; i++) {
+    value += amplitude * noise3D(p * frequency);
+    frequency *= 2.0;
+    amplitude *= 0.5;
+  }
+  return value;
+}
+
 fn cloudSDF(p : vec3<f32>) -> f32 {
   let k = volumeUniforms.smoothness;
   var d = 1e10;
@@ -308,6 +355,23 @@ fn cloudSDF(p : vec3<f32>) -> f32 {
     let heightFrac = smoothstep(volumeUniforms.gradientBottom, volumeUniforms.gradientTop, p.y);
     d += heightFrac * gStrength;
   }
+
+  // Billowy noise: large-scale deformation (cauliflower bumps)
+  let billowyStr = volumeUniforms.billowyStrength;
+  if (billowyStr > 0.0) {
+    let bn = fbm3D(p * volumeUniforms.billowyScale, 4);
+    d += bn * billowyStr;
+  }
+
+  // Wispy noise: fine detail erosion at edges
+  let wispyStr = volumeUniforms.wispyStrength;
+  if (wispyStr > 0.0) {
+    let wn = fbm3D(p * volumeUniforms.wispyScale, 3);
+    d += wn * wispyStr;
+  }
+
+  // Coverage: shift the entire SDF inward (negative = puffier)
+  d -= volumeUniforms.coverage;
 
   return d;
 }
@@ -545,9 +609,9 @@ async function init() {
     },
   });
 
-  // Volume uniform buffer: mat4 (64) + vec3+u32 (16) + 4×f32 (16) + vec3 (16) + vec3 (16) = 128
+  // Volume uniform buffer: 144 bytes (see VolumeUniforms struct)
   const volumeUniformBuffer = device.createBuffer({
-    size: 128,
+    size: 144,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
@@ -615,6 +679,11 @@ async function init() {
     gradientBottom: -0.2,
     gradientTop: 0.5,
     gradientStrength: 0.0,
+    billowyScale: 1.5,
+    billowyStrength: 0.0,
+    wispyScale: 8.0,
+    wispyStrength: 0.0,
+    coverage: 0.0,
     blendMode: 'Sharp',
     smoothness: 0.3,
   };
@@ -661,6 +730,13 @@ async function init() {
   gradientFolder.add(params, 'gradientBottom', -1.0, 1.0, 0.05).name('Bottom');
   gradientFolder.add(params, 'gradientTop', -1.0, 1.0, 0.05).name('Top');
   gradientFolder.add(params, 'gradientStrength', 0.0, 1.0, 0.01).name('Strength');
+
+  const noiseFolder = gui.addFolder('Noise');
+  noiseFolder.add(params, 'billowyScale', 0.5, 5.0, 0.1).name('Billowy Scale');
+  noiseFolder.add(params, 'billowyStrength', 0.0, 0.5, 0.01).name('Billowy Strength');
+  noiseFolder.add(params, 'wispyScale', 2.0, 20.0, 0.5).name('Wispy Scale');
+  noiseFolder.add(params, 'wispyStrength', 0.0, 0.3, 0.01).name('Wispy Strength');
+  noiseFolder.add(params, 'coverage', -0.5, 0.5, 0.01).name('Coverage');
 
   gui.add(params, 'blendMode', ['Sharp', 'Smooth']).name('Blend Mode');
   gui.add(params, 'smoothness', 0.05, 1.0, 0.01).name('Smoothness');
@@ -728,8 +804,18 @@ async function init() {
     device.queue.writeBuffer(volumeUniformBuffer, 80, new Float32Array([
       smoothnessValue, params.gradientBottom, params.gradientTop, params.gradientStrength,
     ]));
-    device.queue.writeBuffer(volumeUniformBuffer, 96, new Float32Array(cloudBounds.min));
-    device.queue.writeBuffer(volumeUniformBuffer, 112, new Float32Array(cloudBounds.max));
+    // boxMin (vec3) + billowyScale (f32)
+    device.queue.writeBuffer(volumeUniformBuffer, 96, new Float32Array([
+      ...cloudBounds.min, params.billowyScale,
+    ]));
+    // boxMax (vec3) + billowyStrength (f32)
+    device.queue.writeBuffer(volumeUniformBuffer, 112, new Float32Array([
+      ...cloudBounds.max, params.billowyStrength,
+    ]));
+    // wispyScale, wispyStrength, coverage, padding
+    device.queue.writeBuffer(volumeUniformBuffer, 128, new Float32Array([
+      params.wispyScale, params.wispyStrength, params.coverage, 0.0,
+    ]));
 
     const commandEncoder = device.createCommandEncoder();
     const textureView = context.getCurrentTexture().createView();

@@ -229,27 +229,29 @@ From `blender_shader_dump_props.json`, we can mirror the exact node settings:
 > **Phase 2d Expected Outcome:** Three distinct ways to define cloud shapes: (A) manually specify sphere positions/radii for precise control, (B) draw a curve and spheres automatically distribute along it — useful for elongated wispy clouds, (C) provide a mesh and spheres fill its interior — useful for arbitrary shapes. Switching between modes produces visibly different cloud silhouettes while all feeding the same SDF pipeline.
 
 #### 2e. Density Gradient
-- [ ] Implement a vertical density falloff: denser at the bottom, softer at the top.
-  > *Outcome:* The `sampleDensity` function multiplies the SDF-based density by a height-dependent factor. At the cloud's bottom Y extent, the multiplier is 1.0 (full density). At the top, it fades toward 0.0. The cloud appears solid at the base and translucent/wispy at the crown.
-- [ ] Make the gradient configurable (height range, falloff curve).
-  > *Outcome:* Parameters `gradientBottom`, `gradientTop`, and `falloffExponent` control where the transition happens and how sharp it is. A linear falloff produces even fading; an exponential curve creates a denser core with a rapid fade near the top.
+- [x] Implement a vertical density falloff: denser at the bottom, softer at the top.
+  > *Outcome:* `cloudSDF` applies height-based erosion via `smoothstep(gradientBottom, gradientTop, p.y) * gradientStrength`, pushing the SDF outward at higher Y values. The cloud surface erodes at the top while remaining solid at the base.
+- [x] Make the gradient configurable (height range, falloff curve).
+  > *Outcome:* GUI "Density Gradient" folder with Bottom (-1..1), Top (-1..1), and Strength (0..1) controls. Strength defaults to 0 (off). Values passed as uniforms to the shader each frame.
+- [x] Auto-fitting bounding box for the wireframe cube and raymarcher AABB.
+  > *Outcome:* `computeBounds()` scans all sphere centers ± radii with padding. Both the green wireframe cube vertices and the shader's `intersectAABB` use dynamic `boxMin`/`boxMax` uniforms. Bounds auto-update on every regeneration.
 
 > **Phase 2e Expected Outcome:** The cloud is no longer uniform density throughout — the bottom half appears thicker/more opaque (denser core), while the top gradually fades out with wispy, translucent edges. This mimics real cumulus clouds where moisture is densest at the base. Adjusting the gradient parameters visibly shifts where the dense-to-transparent transition occurs.
 
 > **Phase 2 Overall Outcome:** An organic, cumulus-shaped cloud form inside the wireframe cube, built from hundreds of smooth-blended spheres with fractal surface detail and height-based density variation. The shape is recognizably cloud-like even without noise — a lumpy, flat-bottomed, rounded-top mass with natural irregularity.
 
 ### Phase 3: Noise & Detail
-- [ ] Implement a 3D Noise function in WGSL (Perlin or Simplex).
-  > *Outcome:* A `noise3D(p)` function in WGSL that returns a smooth, continuous value in `[-1, 1]` for any 3D point. Uses gradient-based noise (Perlin or Simplex) with no visible grid artifacts.
-- [ ] Create a Fractional Brownian Motion (fBm) wrapper for multi-layered detail.
-  > *Outcome:* `fbm3D(p, octaves)` layers multiple `noise3D` calls at increasing frequency and decreasing amplitude. Each octave doubles the frequency and halves the contribution, producing natural multi-scale detail.
-- [ ] Integrate large-scale fBm noise to erode the SDF edges ("Billowy Noise").
-  > *Outcome:* The `cloudSDF` value is offset by low-frequency fBm noise (`Big Scale ~ 0.1`). This pushes the cloud surface in and out by large amounts, creating dramatic rolling bumps and deep cavities in the silhouette — the signature "cauliflower" look.
-- [ ] Add a second layer of high-frequency noise for soft edges ("Wispy Noise").
-  > *Outcome:* A second fBm pass at higher frequency (`Small Scale ~ 12.0`) is subtracted from the density near the cloud surface. This dissolves hard edges into soft, fuzzy wisps that trail off into empty space.
-- [ ] Match Blender controls: `Coverage`, `Billowy Factor`, and multi-scale noise blend
+- [x] Implement a 3D Noise function in WGSL (Perlin or Simplex).
+  > *Outcome:* Hash-based 3D gradient noise (`noise3D`) in WGSL using `hash33` for gradient generation. Smooth Hermite interpolation (`3t²-2t³`) produces continuous values with no visible grid artifacts.
+- [x] Create a Fractional Brownian Motion (fBm) wrapper for multi-layered detail.
+  > *Outcome:* `fbm3D(p, octaves)` layers multiple `noise3D` calls. Each octave doubles frequency and halves amplitude, producing natural multi-scale detail.
+- [x] Integrate large-scale fBm noise to erode the SDF edges ("Billowy Noise").
+  > *Outcome:* `cloudSDF` adds `fbm3D(p * billowyScale, 4) * billowyStrength`. Low-frequency noise pushes the cloud surface in and out, creating rolling bumps and cavities. GUI: Billowy Scale (0.5–5.0), Billowy Strength (0–0.5).
+- [x] Add a second layer of high-frequency noise for soft edges ("Wispy Noise").
+  > *Outcome:* `cloudSDF` adds `fbm3D(p * wispyScale, 3) * wispyStrength`. High-frequency noise dissolves hard edges into soft wisps. GUI: Wispy Scale (2–20), Wispy Strength (0–0.3).
+- [x] Match Blender controls: `Coverage`, `Billowy Factor`, and multi-scale noise blend
       (`Big Scale`, `Mid Scale`, `Small Scale`).
-  > *Outcome:* Three noise layers (big, mid, small) are blended using the same mix modes as the Blender shader (LINEAR_LIGHT, OVERLAY). `Coverage` remaps the noise threshold — higher values make the cloud puffier/larger. `Billowy Factor` scales the big-noise displacement amplitude. All parameters are GPU uniforms adjustable without recompilation.
+  > *Outcome:* `Coverage` uniform shifts the entire SDF inward/outward (`d -= coverage`). Positive = puffier, negative = eroded. Two noise layers (billowy + wispy) with independent scale/strength. GUI: Coverage (-0.5 to 0.5).
 - [ ] Add a Z-based shaping block: `Zpadding`, `ZBlur`, `Z Offset`, and `FlipZ`.
   > *Outcome:* A vertical gradient mask is applied to the density. `Z Offset` shifts the gradient up/down, `ZBlur` controls the transition softness, `Zpadding` adds a buffer zone at the top/bottom, and `FlipZ` inverts the gradient direction. This sculpts the cloud's vertical profile independently of the noise.
 
@@ -284,8 +286,8 @@ From `blender_shader_dump_props.json`, we can mirror the exact node settings:
 - [x] ~~Phase 2b (CPU Sphere Generator) — grid + jitter + flatten + radius assignment.~~
 - [x] ~~Phase 2c (Replication) — iterative child sphere scattering.~~
 - [x] ~~Phase 2d (Shape Modes) — Cumulus/Wispy/Ellipsoid with lil-gui switching.~~
-- **Next Step:** Phase 2e (Density Gradient) — vertical density falloff (denser bottom, softer top).
-- **Then:** Phase 3 (Noise & Detail) — 3D noise in WGSL, fBm, billowy + wispy noise layers.
+- [x] ~~Phase 2e (Density Gradient) — vertical density falloff + auto-fitting bounding box.~~
+- **Next Step:** Phase 3 (Noise & Detail) — 3D noise in WGSL, fBm, billowy + wispy noise layers.
 - **Then:** Phase 4 (Lighting & Refinement) — Beer's Law, sun light, directional scattering.
 
 ---

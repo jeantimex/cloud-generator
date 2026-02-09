@@ -63,6 +63,10 @@ function generateCumulus(options = {}) {
     pointSeparation = 0.25,
     flattenBottom = -0.3,
     seed = 42,
+    replicationIterations = 2,
+    childrenPerSphere = 4,
+    keepProbability = 0.5,
+    scaleMult = 0.55,
   } = options;
 
   const rng = createRNG(seed);
@@ -84,11 +88,19 @@ function generateCumulus(options = {}) {
     }
   }
 
-  return replicateSpheres(spheres, rng);
+  return replicateSpheres(spheres, rng, {
+    replicationIterations, childrenPerSphere, keepProbability, scaleMult,
+  });
 }
 
 function generateWispy(options = {}) {
-  const { seed = 42 } = options;
+  const {
+    seed = 42,
+    replicationIterations = 1,
+    childrenPerSphere = 3,
+    keepProbability = 0.6,
+    scaleMult = 0.5,
+  } = options;
   const rng = createRNG(seed);
   const spheres = [];
 
@@ -123,15 +135,18 @@ function generateWispy(options = {}) {
   }
 
   return replicateSpheres(spheres, rng, {
-    replicationIterations: 1,
-    childrenPerSphere: 3,
-    keepProbability: 0.6,
-    scaleMult: 0.5,
+    replicationIterations, childrenPerSphere, keepProbability, scaleMult,
   });
 }
 
 function generateEllipsoid(options = {}) {
-  const { seed = 42 } = options;
+  const {
+    seed = 42,
+    replicationIterations = 1,
+    childrenPerSphere = 3,
+    keepProbability = 0.5,
+    scaleMult = 0.5,
+  } = options;
   const rng = createRNG(seed);
   const spheres = [];
 
@@ -158,10 +173,7 @@ function generateEllipsoid(options = {}) {
   }
 
   return replicateSpheres(spheres, rng, {
-    replicationIterations: 1,
-    childrenPerSphere: 3,
-    keepProbability: 0.5,
-    scaleMult: 0.5,
+    replicationIterations, childrenPerSphere, keepProbability, scaleMult,
   });
 }
 
@@ -556,23 +568,58 @@ async function init() {
   const modelViewProjectionMatrix = mat4.create();
 
   // GUI
-  const generators = {
-    Cumulus: generateCumulus,
-    Wispy: generateWispy,
-    Ellipsoid: generateEllipsoid,
-  };
-
   const params = {
     shape: 'Cumulus',
+    gridX: 4,
+    gridZ: 4,
+    pointSeparation: 0.25,
+    iterations: 2,
+    children: 4,
+    keepProb: 0.5,
+    scaleMult: 0.55,
+    seed: 42,
     blendMode: 'Sharp',
     smoothness: 0.3,
   };
-  const gui = new GUI();
-  gui.add(params, 'shape', ['Cumulus', 'Wispy', 'Ellipsoid']).name('Shape').onChange((value) => {
-    const data = generators[value]();
+
+  function regenerate() {
+    let data;
+    const repOpts = {
+      replicationIterations: params.iterations,
+      childrenPerSphere: params.children,
+      keepProbability: params.keepProb,
+      scaleMult: params.scaleMult,
+      seed: params.seed,
+    };
+    if (params.shape === 'Cumulus') {
+      data = generateCumulus({
+        gridX: params.gridX,
+        gridZ: params.gridZ,
+        pointSeparation: params.pointSeparation,
+        ...repOpts,
+      });
+    } else if (params.shape === 'Wispy') {
+      data = generateWispy(repOpts);
+    } else {
+      data = generateEllipsoid(repOpts);
+    }
     rebuildSpheres(data);
-    console.log(`[${value}] Generated ${sphereCount} spheres`);
-  });
+    console.log(`[${params.shape}] Generated ${sphereCount} spheres`);
+  }
+
+  const gui = new GUI();
+  gui.add(params, 'shape', ['Cumulus', 'Wispy', 'Ellipsoid']).name('Shape').onChange(regenerate);
+
+  const shapeFolder = gui.addFolder('Shape Settings');
+  shapeFolder.add(params, 'gridX', 1, 12, 1).name('Grid X').onChange(regenerate);
+  shapeFolder.add(params, 'gridZ', 1, 12, 1).name('Grid Z').onChange(regenerate);
+  shapeFolder.add(params, 'pointSeparation', 0.1, 0.5, 0.01).name('Separation').onChange(regenerate);
+  shapeFolder.add(params, 'iterations', 0, 4, 1).name('Iterations').onChange(regenerate);
+  shapeFolder.add(params, 'children', 1, 8, 1).name('Children').onChange(regenerate);
+  shapeFolder.add(params, 'keepProb', 0.1, 1.0, 0.05).name('Keep Prob').onChange(regenerate);
+  shapeFolder.add(params, 'scaleMult', 0.2, 0.9, 0.05).name('Scale Mult').onChange(regenerate);
+  shapeFolder.add(params, 'seed', 1, 100, 1).name('Seed').onChange(regenerate);
+
   gui.add(params, 'blendMode', ['Sharp', 'Smooth']).name('Blend Mode');
   gui.add(params, 'smoothness', 0.05, 1.0, 0.01).name('Smoothness');
 

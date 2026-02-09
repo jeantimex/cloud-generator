@@ -290,6 +290,40 @@ From `blender_shader_dump_props.json`, we can mirror the exact node settings:
 
 ---
 
-## 5. References
+## 5. Blender Parameter Mapping (Future Work)
+
+Reference: `AL_CloudCreator_Generator` panel in Blender.
+
+### Already Implemented
+| Blender Param | Our Param | Notes |
+|---|---|---|
+| Seed | `seed` | RNG seed for reproducibility |
+| PointSeparation | `pointSeparation` | Grid spacing between base spheres |
+| FlattenBottom | `flattenBottom` | Clamp Y below threshold |
+| Children > Iterations | `iterations` | Replication passes |
+| Children > ScaleMult | `scaleMult` | Child sphere scale factor |
+
+### To Add Later
+| Blender Param | Value | What It Does | How to Map |
+|---|---|---|---|
+| Cloud Specie | Fractus, Cumulus, etc. | Cloud type preset | Extend Shape dropdown with presets that set multiple params at once |
+| Length / Width | 1.0 / 0.25 | Grid dimensions as continuous values | Replace integer `gridX`/`gridZ` with length-based sizing: `gridX = Math.round(length / pointSeparation)` |
+| Scale | 7.0 | Overall scale multiplier | New uniform — multiply all sphere positions + radii before upload |
+| Distortion | 3.0 | Noise-based position warping amplitude | Apply 3D noise displacement to sphere positions after grid placement |
+| DistortionSeed | 0 | Separate seed for distortion noise | Second RNG or noise seed offset |
+| Displacement > Iterations | 5 | Mesh subdivision passes before volume conversion | Less relevant for SDF raymarching; could apply iterative noise refinement |
+| Displacement > Displacement | 2.0 | Noise amplitude on vertices | Post-generation noise offset on sphere positions (pairs with Phase 3 noise) |
+| Displacement > Spread | 0.3 | How far displacement reaches | Noise frequency/falloff control |
+| Displacement > Cleanup | 1.0 | Remove small/isolated pieces | Cull spheres below a radius threshold or isolated from neighbors |
+| Children > Density | 10.0 | Points scattered per face | Maps to `childrenPerSphere` — Blender uses higher values because it scatters on mesh faces |
+
+### Notes
+- The **Displacement** section is the biggest gap — it adds organic irregularity beyond sphere placement by warping positions with noise. This pairs naturally with Phase 3 (noise) since it's applying noise-based offsets to sphere geometry on the CPU before the shader noise adds surface detail.
+- **Cloud Specie** presets could be a convenience feature: selecting "Fractus" auto-sets grid size, separation, iterations, etc. to known-good values for that cloud type.
+- **Scale** is straightforward but important for fitting clouds into different scene sizes.
+
+---
+
+## 6. References
 - **Houdini Cloud Modeling:** [https://www.sidefx.com/docs/houdini/model/cloud.html](https://www.sidefx.com/docs/houdini/model/cloud.html)
 - **Blender Project:** `blender/CloudCreatorPro_Blender4.5.blend`

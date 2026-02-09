@@ -260,7 +260,11 @@ struct VolumeUniforms {
   lightDir : vec3<f32>,
   ambient : f32,
   cloudColor : vec3<f32>,
-  _pad : f32,
+  time : f32,
+  timeScale : f32,
+  warpStrength : f32,
+  _pad1 : f32,
+  _pad2 : f32,
 };
 
 @binding(0) @group(0) var<uniform> volumeUniforms : VolumeUniforms;
@@ -353,6 +357,19 @@ fn cloudSDF(p : vec3<f32>) -> f32 {
     }
   }
 
+  let t = volumeUniforms.time * volumeUniforms.timeScale;
+  
+  // Domain Warping: Offset the noise coordinates with another noise function
+  // This creates the "swirling" and "wispy curls" characteristic of Houdini clouds.
+  var warpPos = p;
+  let warpStr = volumeUniforms.warpStrength;
+  if (warpStr > 0.0) {
+    let warpX = fbm3D(p * 1.5 + vec3(t, 0.0, 0.0), 3);
+    let warpY = fbm3D(p * 1.5 + vec3(0.0, t, 0.0), 3);
+    let warpZ = fbm3D(p * 1.5 + vec3(0.0, 0.0, t), 3);
+    warpPos += vec3(warpX, warpY, warpZ) * warpStr;
+  }
+
   // Density gradient: erode the SDF based on height
   let gStrength = volumeUniforms.gradientStrength;
   if (gStrength > 0.0) {
@@ -367,14 +384,14 @@ fn cloudSDF(p : vec3<f32>) -> f32 {
   // Billowy noise: large-scale deformation (cauliflower bumps)
   let billowyStr = volumeUniforms.billowyStrength;
   if (billowyStr > 0.0) {
-    let bn = fbm3D(p * volumeUniforms.billowyScale, 4);
+    let bn = fbm3D(warpPos * volumeUniforms.billowyScale + vec3(0.0, -t * 0.5, 0.0), 4);
     d += bn * billowyStr;
   }
 
   // Wispy noise: fine detail erosion at edges
   let wispyStr = volumeUniforms.wispyStrength;
   if (wispyStr > 0.0) {
-    let wn = fbm3D(p * volumeUniforms.wispyScale, 3);
+    let wn = fbm3D(warpPos * volumeUniforms.wispyScale + vec3(t, t * 0.2, 0.0), 3);
     d += wn * wispyStr;
   }
 
@@ -734,9 +751,9 @@ async function init() {
     },
   });
 
-  // Volume uniform buffer: 272 bytes (see VolumeUniforms struct)
+  // Volume uniform buffer: 288 bytes (see VolumeUniforms struct)
   const volumeUniformBuffer = device.createBuffer({
-    size: 272,
+    size: 288,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
@@ -835,6 +852,8 @@ async function init() {
     cloudScale: 1.0,
     blendMode: 'Sharp',
     smoothness: 0.3,
+    timeScale: 0.2,
+    warpStrength: 0.15,
   };
 
   function regenerate() {
@@ -912,6 +931,10 @@ async function init() {
   appearanceFolder.addColor(params, 'cloudColor').name('Cloud Color');
   appearanceFolder.add(params, 'ambient', 0.0, 1.0, 0.01).name('Ambient');
   appearanceFolder.add(params, 'cloudScale', 0.2, 3.0, 0.05).name('Cloud Scale').onChange(regenerate);
+
+  const animationFolder = gui.addFolder('Animation');
+  animationFolder.add(params, 'timeScale', 0.0, 1.0, 0.01).name('Evolution Speed');
+  animationFolder.add(params, 'warpStrength', 0.0, 1.0, 0.01).name('Warp Strength');
 
   gui.add(params, 'blendMode', ['Sharp', 'Smooth']).name('Blend Mode');
   gui.add(params, 'smoothness', 0.05, 1.0, 0.01).name('Smoothness');
@@ -1003,7 +1026,8 @@ async function init() {
     const cb = (cc & 0xff) / 255;
     device.queue.writeBuffer(volumeUniformBuffer, 240, new Float32Array([
       params.sunX, params.sunY, params.sunZ, params.ambient,
-      cr, cg, cb, 0.0,
+      cr, cg, cb, performance.now() / 1000,
+      params.timeScale, params.warpStrength, 0.0, 0.0,
     ]));
 
     const commandEncoder = device.createCommandEncoder();

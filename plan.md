@@ -157,70 +157,125 @@ From `blender_shader_dump_props.json`, we can mirror the exact node settings:
 > 3. *Cloud Shape from Polygon* — Fill arbitrary 3D meshes with adaptively-sized spheres
 
 ### Phase 1: Raymarching Engine
-- [ ] Implement Ray-Box (AABB) intersection logic in the vertex/fragment shader.
-- [ ] Create the core Raymarching loop (stepping through the volume).
-- [ ] Implement a basic "Density" sample based on the cube's bounds.
-- [ ] Update `shaderCode` to include a dedicated volume rendering pass.
+- [x] Implement Ray-Box (AABB) intersection logic in the vertex/fragment shader.
+  > *Outcome:* `intersectAABB()` function in WGSL uses the slab method to return `(tNear, tFar)` for any ray against the `[-1,1]³` cube. Rays that miss the box are discarded (fragment outputs transparent black).
+- [x] Create the core Raymarching loop (stepping through the volume).
+  > *Outcome:* Fragment shader steps 64 samples from `tNear` to `tFar`, accumulating opacity via Beer's Law (`transmittance *= exp(-density * stepSize)`). Early exit when transmittance < 0.01.
+- [x] Implement a basic "Density" sample based on the cube's bounds.
+  > *Outcome:* `sampleDensity(p)` evaluates a sphere SDF at origin (radius 0.5) and returns a `smoothstep` density — 1.0 inside, 0.0 outside, with a soft 0.2-unit transition edge.
+- [x] Update `shaderCode` to include a dedicated volume rendering pass.
+  > *Outcome:* A second render pipeline (triangle-list, alpha-blended) draws a full-screen quad after the wireframe. Both pipelines share one render pass.
+
+> **Phase 1 Expected Outcome:** A semi-transparent white sphere fog (radius 0.5) centered in the wireframe cube, rendered via a full-screen quad with alpha blending. The grid floor and green wireframe remain visible through the fog. The sphere has smooth, soft edges (not a hard cutoff) produced by `smoothstep` density and Beer's Law transmittance.
 
 ### Phase 2: Cloud Shape
 
 #### 2a. GPU Sphere SDF Foundation
 - [ ] Implement `sphereSDF(p, center, radius)` in WGSL.
+  > *Outcome:* A helper function `sphereSDF(p, center, radius) -> f32` returns the signed distance from point `p` to a sphere surface. Negative inside, positive outside.
 - [ ] Implement `smin(a, b, k)` (polynomial smooth-min) for blending sphere SDFs.
+  > *Outcome:* A polynomial smooth-min function that blends two SDF values with smoothness factor `k`. Where two spheres overlap, their surfaces merge into a smooth organic join instead of a hard intersection.
 - [ ] Create a `cloudSDF(p)` function that loops over a storage buffer of spheres
       and returns the smooth-union of all sphere distances.
+  > *Outcome:* `cloudSDF(p)` iterates over all spheres in the storage buffer, calling `sphereSDF` for each and accumulating with `smin`. Returns a single blended distance value representing the entire cloud shape.
 - [ ] Create the storage buffer + bind group for sphere data (`vec4[]`: xyz=center, w=radius).
+  > *Outcome:* A GPU storage buffer holds an array of `vec4` (xyz = center, w = radius). A separate uniform holds `sphereCount`. Both are bound to the volume pipeline via a new bind group entry.
 - [ ] Upload a few hand-placed test spheres and visualize the SDF in the raymarcher.
+  > *Outcome:* 3–5 test spheres at hand-picked positions (e.g. one at origin, others offset) with varying radii. The raymarcher's `sampleDensity` now calls `cloudSDF` instead of the hardcoded single sphere.
+
+> **Phase 2a Expected Outcome:** The single hardcoded sphere is replaced by 3–5 hand-placed test spheres of varying sizes that smoothly blend into each other via `smin`. The result looks like an organic, blobby mass — overlapping spheres merge seamlessly without visible seams. Sphere data is driven by a GPU storage buffer, not hardcoded in the shader.
 
 #### 2b. CPU Sphere Generator (mirrors Blender `AL_CloudCreator_Generator`)
 - [ ] **Grid generation:** Create a 2D grid of points along two axes
       (`length × width`), spaced by `pointSeparation`.
+  > *Outcome:* A JavaScript function generates a flat 2D grid of `(x, z)` positions. For example, `length=5, width=3, pointSeparation=0.3` produces a 5×3 grid of evenly spaced points in the XZ plane.
 - [ ] **Random jitter:** Offset each point by `random[-1,1]³ × pointSeparation`
       (seeded RNG for reproducibility).
+  > *Outcome:* Each grid point is displaced randomly in X, Y, and Z by up to `±pointSeparation`. A seeded PRNG ensures the same seed always produces the same layout.
 - [ ] **Flatten bottom:** Clamp Z values below a configurable threshold.
+  > *Outcome:* Any sphere whose Y coordinate falls below the `flattenBottom` threshold has its Y clamped to that value, producing a flat base.
 - [ ] **Assign radius:** `pointSeparation × randomUniform(0.90, 1.42)` per sphere.
+  > *Outcome:* Each sphere gets a radius of `pointSeparation * random(0.90, 1.42)`, so neighboring spheres vary slightly in size for natural irregularity.
 - [ ] **Upload & verify:** Push sphere array to GPU, confirm cloud blob renders.
+  > *Outcome:* The generated sphere array is written to the GPU storage buffer. The raymarcher renders the full set as a single blobby cloud mass inside the wireframe cube.
+
+> **Phase 2b Expected Outcome:** A roughly elliptical cloud blob made of ~20–50 spheres arranged in a jittered grid pattern. The bottom is flat (clamped), the top is rounded. Each sphere has a slightly different radius (0.90–1.42× base), giving the shape natural irregularity. The blob fills roughly half the wireframe cube and reads as a crude cumulus base shape.
 
 #### 2c. Sphere Replication (mirrors Blender Repeat Zone)
 - [ ] **Replication loop** (N iterations, configurable):
       For each existing sphere, scatter M child points on its surface
       (uniform random directions at parent radius distance).
+  > *Outcome:* Each iteration walks the current sphere list, generates M random directions per sphere, and places child spheres on the parent's surface at those directions. Children are added to the list for the next iteration.
 - [ ] **Shrinking scale:** Child radius = `parentRadius × scaleMult` per iteration.
+  > *Outcome:* Each iteration's children are smaller than their parents (e.g. `scaleMult=0.6`). After 3 iterations: base → 60% → 36% → 22% of original radius, creating progressively finer detail.
 - [ ] **Random thinning:** Keep only a fraction of children (probability mask)
       for organic variation.
+  > *Outcome:* A `keepProbability` (e.g. 0.5) randomly discards some children each iteration. This prevents exponential blowup and creates irregular, natural-looking gaps in the surface detail.
 - [ ] **Join:** Append child spheres to the master array, re-upload to GPU.
+  > *Outcome:* All spheres (original + all replication passes) are concatenated into one flat array and re-uploaded to the storage buffer. `sphereCount` uniform is updated to the new total.
+
+> **Phase 2c Expected Outcome:** The base cloud blob from 2b now has bumpy, cauliflower-like surface detail. Each replication iteration adds progressively smaller spheres on the surface of existing ones, creating fractal-like organic protrusions. With 2–3 iterations, the sphere count grows to ~200–500. The shape looks noticeably more cloud-like than the smooth blob from 2b — lumpy and irregular with varied scale detail.
 
 #### 2d. Shape Modes
 - [ ] **Mode A — Generate:** Hand-authored `(position, radius)` list for direct sculpting.
+  > *Outcome:* A simple API/data structure where the user provides an explicit array of `{x, y, z, radius}` values. These are uploaded directly to the GPU — full manual control over every sphere.
 - [ ] **Mode B — From Line:** Define a polyline/curve backbone (control points);
       distribute spheres along it with varying radii (mirrors `AL_CloudCreator_GeneratorCurve`).
+  > *Outcome:* Given an array of 3D control points defining a curve, spheres are distributed at regular intervals along the polyline. Radii can vary along the curve (e.g. thicker in the middle, thinner at ends). Produces elongated cloud shapes like cirrus or stratus.
 - [ ] **Mode C — From Polygon:** Accept an arbitrary 3D mesh, sample points
       inside its volume (grid fill), place spheres at each sample point with
       radius proportional to distance-to-surface.
+  > *Outcome:* Given mesh vertex/face data, a 3D grid fills the mesh interior. At each interior grid point, a sphere is placed with radius proportional to distance from the mesh surface (larger deep inside, smaller near edges). Allows cloud shapes that conform to arbitrary silhouettes.
+
+> **Phase 2d Expected Outcome:** Three distinct ways to define cloud shapes: (A) manually specify sphere positions/radii for precise control, (B) draw a curve and spheres automatically distribute along it — useful for elongated wispy clouds, (C) provide a mesh and spheres fill its interior — useful for arbitrary shapes. Switching between modes produces visibly different cloud silhouettes while all feeding the same SDF pipeline.
 
 #### 2e. Density Gradient
 - [ ] Implement a vertical density falloff: denser at the bottom, softer at the top.
+  > *Outcome:* The `sampleDensity` function multiplies the SDF-based density by a height-dependent factor. At the cloud's bottom Y extent, the multiplier is 1.0 (full density). At the top, it fades toward 0.0. The cloud appears solid at the base and translucent/wispy at the crown.
 - [ ] Make the gradient configurable (height range, falloff curve).
+  > *Outcome:* Parameters `gradientBottom`, `gradientTop`, and `falloffExponent` control where the transition happens and how sharp it is. A linear falloff produces even fading; an exponential curve creates a denser core with a rapid fade near the top.
+
+> **Phase 2e Expected Outcome:** The cloud is no longer uniform density throughout — the bottom half appears thicker/more opaque (denser core), while the top gradually fades out with wispy, translucent edges. This mimics real cumulus clouds where moisture is densest at the base. Adjusting the gradient parameters visibly shifts where the dense-to-transparent transition occurs.
+
+> **Phase 2 Overall Outcome:** An organic, cumulus-shaped cloud form inside the wireframe cube, built from hundreds of smooth-blended spheres with fractal surface detail and height-based density variation. The shape is recognizably cloud-like even without noise — a lumpy, flat-bottomed, rounded-top mass with natural irregularity.
 
 ### Phase 3: Noise & Detail
 - [ ] Implement a 3D Noise function in WGSL (Perlin or Simplex).
+  > *Outcome:* A `noise3D(p)` function in WGSL that returns a smooth, continuous value in `[-1, 1]` for any 3D point. Uses gradient-based noise (Perlin or Simplex) with no visible grid artifacts.
 - [ ] Create a Fractional Brownian Motion (fBm) wrapper for multi-layered detail.
+  > *Outcome:* `fbm3D(p, octaves)` layers multiple `noise3D` calls at increasing frequency and decreasing amplitude. Each octave doubles the frequency and halves the contribution, producing natural multi-scale detail.
 - [ ] Integrate large-scale fBm noise to erode the SDF edges ("Billowy Noise").
+  > *Outcome:* The `cloudSDF` value is offset by low-frequency fBm noise (`Big Scale ~ 0.1`). This pushes the cloud surface in and out by large amounts, creating dramatic rolling bumps and deep cavities in the silhouette — the signature "cauliflower" look.
 - [ ] Add a second layer of high-frequency noise for soft edges ("Wispy Noise").
+  > *Outcome:* A second fBm pass at higher frequency (`Small Scale ~ 12.0`) is subtracted from the density near the cloud surface. This dissolves hard edges into soft, fuzzy wisps that trail off into empty space.
 - [ ] Match Blender controls: `Coverage`, `Billowy Factor`, and multi-scale noise blend
       (`Big Scale`, `Mid Scale`, `Small Scale`).
+  > *Outcome:* Three noise layers (big, mid, small) are blended using the same mix modes as the Blender shader (LINEAR_LIGHT, OVERLAY). `Coverage` remaps the noise threshold — higher values make the cloud puffier/larger. `Billowy Factor` scales the big-noise displacement amplitude. All parameters are GPU uniforms adjustable without recompilation.
 - [ ] Add a Z-based shaping block: `Zpadding`, `ZBlur`, `Z Offset`, and `FlipZ`.
+  > *Outcome:* A vertical gradient mask is applied to the density. `Z Offset` shifts the gradient up/down, `ZBlur` controls the transition softness, `Zpadding` adds a buffer zone at the top/bottom, and `FlipZ` inverts the gradient direction. This sculpts the cloud's vertical profile independently of the noise.
+
+> **Phase 3 Expected Outcome:** The smooth sphere-blob cloud from Phase 2 transforms into a realistic, detailed cloud. Large-scale "billowy" noise creates dramatic rolling shapes and deep cavities in the silhouette. Fine "wispy" noise adds soft, fuzzy edges that dissolve into the air. Three noise scales (big ~0.1, mid ~4.12, small ~12.0) layer together for multi-frequency detail. The `Coverage` parameter controls overall cloud size (more coverage = puffier), `Billowy Factor` controls the intensity of large deformations, and Z-shaping parameters sculpt the vertical profile. The result closely matches the Blender CloudCreatorPro reference — a photorealistic cloud silhouette with organic, non-repeating detail.
 
 ### Phase 4: Lighting & Refinement
 - [ ] Implement Beer's Law for light absorption (translucency).
+  > *Outcome:* Light transmittance through the cloud follows `exp(-absorption * density * distance)`. Dense regions appear darker/more opaque when lit from behind; thin regions glow with transmitted light. This replaces the current uniform white color with physically-based attenuation.
 - [ ] Add a simple "Sun" light source.
+  > *Outcome:* A directional light defined by a `lightDirection` uniform vector and `lightColor`. The cloud's illumination varies across its surface — the sun-facing side is bright, the opposite side is in shadow.
 - [ ] Implement "directional scattering" (sampling density towards the light).
+  > *Outcome:* At each raymarch sample, a secondary march toward the light direction estimates how much cloud material the light must pass through to reach that point. Points deep inside or on the shadow side receive less light; points near the sun-facing surface receive full illumination. This creates realistic self-shadowing within the cloud.
 - [ ] Optimize step size and performance.
+  > *Outcome:* Adaptive step sizing: large steps through empty space (low density), smaller steps in dense regions for accuracy. Optional early-exit refinements and reduced light-march step counts. Target: interactive frame rates (30+ FPS) with ~200 spheres and noise.
 - [ ] Add optional "dual-volume" style shading (two anisotropy settings) to mimic
       the Blender group behavior.
+  > *Outcome:* Two Henyey-Greenstein phase functions (anisotropy ~0.5 and ~0.9) are evaluated and blended. The low-anisotropy term provides soft, diffuse in-scattering. The high-anisotropy term creates a bright forward-scattering halo (silver lining) when viewed near the sun direction. Combined, they produce the characteristic dual-tone look of the Blender reference.
+
+> **Phase 4 Expected Outcome:** The cloud gains realistic lighting — bright on the sun-facing side, shadowed on the opposite side, with light scattering through thin areas (silver lining effect). Self-shadowing creates depth and dimension. The dual-volume shading produces both soft diffuse scattering and bright forward-scattering halos. Performance is optimized for interactive frame rates. The cloud looks volumetric and three-dimensional — not flat.
 
 ### Phase 5: Interaction (Optional)
 - [ ] Add UI controls for Cloud Scale, Density, and Noise Intensity.
+  > *Outcome:* An on-screen control panel with sliders for: cloud scale (overall size), density (opacity/thickness), noise intensity (detail level), coverage, billowy factor, and light direction. Each slider writes to its corresponding GPU uniform. Changes are reflected in the next frame — real-time interactive feedback with no reload required.
+
+> **Phase 5 Expected Outcome:** Artists can experiment with cloud shapes interactively. Dragging sliders immediately updates the cloud's appearance in the viewport — adjusting size, density, noise detail, and lighting without editing code.
 
 ---
 

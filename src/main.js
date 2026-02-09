@@ -29,9 +29,11 @@ const volumeShaderCode = `
 struct VolumeUniforms {
   inverseViewProjection : mat4x4<f32>,
   cameraPosition : vec3<f32>,
+  sphereCount : u32,
 };
 
 @binding(0) @group(0) var<uniform> volumeUniforms : VolumeUniforms;
+@binding(1) @group(0) var<storage, read> spheres : array<vec4<f32>>;
 
 struct VertexOutput {
   @builtin(position) Position : vec4<f32>,
@@ -66,11 +68,38 @@ fn intersectAABB(origin : vec3<f32>, dir : vec3<f32>, boxMin : vec3<f32>, boxMax
   return vec2(tNear, tFar);
 }
 
+fn sphereSDF(p : vec3<f32>, center : vec3<f32>, radius : f32) -> f32 {
+  return length(p - center) - radius;
+}
+
+fn smin(a : f32, b : f32, k : f32) -> f32 {
+  let h = max(k - abs(a - b), 0.0) / k;
+  return min(a, b) - h * h * k * 0.25;
+}
+
+fn cloudSDF(p : vec3<f32>) -> f32 {
+  let k = 0.3; // smoothness factor
+  var d = 1e10;
+  for (var i = 0u; i < volumeUniforms.sphereCount; i++) {
+    let s = spheres[i];
+    d = smin(d, sphereSDF(p, s.xyz, s.w), k);
+  }
+  return d;
+}
+
 fn sampleDensity(p : vec3<f32>) -> f32 {
-  // Sphere SDF at origin, radius 0.5
-  let dist = length(p) - 0.5;
-  // Soft edge: density transitions from 1 (inside) to 0 (outside) over ~0.2 range
+  let dist = cloudSDF(p);
   return smoothstep(0.1, -0.1, dist);
+}
+
+fn calcNormal(p : vec3<f32>) -> vec3<f32> {
+  let e = 0.001;
+  let n = vec3(
+    cloudSDF(p + vec3(e, 0.0, 0.0)) - cloudSDF(p - vec3(e, 0.0, 0.0)),
+    cloudSDF(p + vec3(0.0, e, 0.0)) - cloudSDF(p - vec3(0.0, e, 0.0)),
+    cloudSDF(p + vec3(0.0, 0.0, e)) - cloudSDF(p - vec3(0.0, 0.0, e)),
+  );
+  return normalize(n);
 }
 
 @fragment
@@ -90,38 +119,42 @@ fn fs_volume(@location(0) ndc : vec2<f32>) -> @location(0) vec4<f32> {
   let t = intersectAABB(rayOrigin, rayDir, boxMin, boxMax);
 
   if (t.x > t.y || t.y < 0.0) {
-    // Ray misses the box
     return vec4(0.0, 0.0, 0.0, 0.0);
   }
 
   let tNear = max(t.x, 0.0);
   let tFar = t.y;
 
-  // Raymarch through the volume
-  let numSteps = 64;
-  let stepSize = (tFar - tNear) / f32(numSteps);
-  var transmittance = 1.0;
-  let absorptionCoeff = 6.0;
-
-  for (var i = 0; i < numSteps; i++) {
-    let tCurrent = tNear + (f32(i) + 0.5) * stepSize;
-    let samplePos = rayOrigin + rayDir * tCurrent;
-    let density = sampleDensity(samplePos);
-
-    if (density > 0.0) {
-      // Beer's Law absorption
-      transmittance *= exp(-density * absorptionCoeff * stepSize);
-    }
-
-    // Early exit when nearly fully opaque
-    if (transmittance < 0.01) {
-      transmittance = 0.0;
+  // Sphere trace to find SDF surface
+  var tCurrent = tNear;
+  var hit = false;
+  for (var i = 0; i < 128; i++) {
+    if (tCurrent > tFar) { break; }
+    let p = rayOrigin + rayDir * tCurrent;
+    let d = cloudSDF(p);
+    if (d < 0.001) {
+      hit = true;
       break;
     }
+    tCurrent += max(d, 0.005); // min step to avoid getting stuck
   }
 
-  let alpha = 1.0 - transmittance;
-  return vec4(1.0, 1.0, 1.0, alpha);
+  if (!hit) {
+    return vec4(0.0, 0.0, 0.0, 0.0);
+  }
+
+  // Shade the surface
+  let hitPos = rayOrigin + rayDir * tCurrent;
+  let normal = calcNormal(hitPos);
+
+  // Diffuse lighting from upper-right
+  let lightDir = normalize(vec3(1.0, 1.0, 0.5));
+  let diffuse = max(dot(normal, lightDir), 0.0);
+  let ambient = 0.3;
+  let shade = ambient + diffuse * 0.7;
+  let color = vec3(shade);
+
+  return vec4(color, 1.0);
 }
 `;
 
@@ -301,15 +334,35 @@ async function init() {
     },
   });
 
-  // Volume uniform buffer: mat4 (64 bytes) + vec3 padded to vec4 (16 bytes) = 80 bytes
+  // Volume uniform buffer: mat4 (64 bytes) + vec3 cameraPosition (12) + u32 sphereCount (4) = 80 bytes
   const volumeUniformBuffer = device.createBuffer({
     size: 80,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
+  // Test spheres: vec4 each (xyz = center, w = radius)
+  const sphereData = new Float32Array([
+    // x,    y,    z,    radius
+     0.0,  0.0,  0.0,  0.4,   // large center sphere
+     0.35, 0.15, 0.0,  0.3,   // right
+    -0.3,  0.05, 0.15, 0.25,  // left-front
+     0.05, 0.4, -0.1,  0.25,  // top
+     0.1, -0.15, 0.35, 0.2,   // front-bottom
+  ]);
+  const sphereCount = sphereData.length / 4;
+
+  const sphereBuffer = device.createBuffer({
+    size: sphereData.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(sphereBuffer, 0, sphereData);
+
   const volumeBindGroup = device.createBindGroup({
     layout: volumePipeline.getBindGroupLayout(0),
-    entries: [{ binding: 0, resource: { buffer: volumeUniformBuffer } }],
+    entries: [
+      { binding: 0, resource: { buffer: volumeUniformBuffer } },
+      { binding: 1, resource: { buffer: sphereBuffer } },
+    ],
   });
 
   const viewProjectionMatrix = mat4.create();
@@ -319,14 +372,48 @@ async function init() {
   const viewMatrix = mat4.create();
   const modelViewProjectionMatrix = mat4.create();
 
+  // Orbit camera state
+  let orbitTheta = Math.PI / 4;   // horizontal angle
+  let orbitPhi = Math.PI / 4;     // vertical angle (from top)
+  let orbitDistance = 6;
+  let isDragging = false;
+  let lastMouseX = 0;
+  let lastMouseY = 0;
+
+  canvas.addEventListener('pointerdown', (e) => {
+    isDragging = true;
+    lastMouseX = e.clientX;
+    lastMouseY = e.clientY;
+    canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (!isDragging) return;
+    const dx = e.clientX - lastMouseX;
+    const dy = e.clientY - lastMouseY;
+    orbitTheta -= dx * 0.005;
+    orbitPhi = Math.max(0.05, Math.min(Math.PI - 0.05, orbitPhi - dy * 0.005));
+    lastMouseX = e.clientX;
+    lastMouseY = e.clientY;
+  });
+  canvas.addEventListener('pointerup', (e) => {
+    isDragging = false;
+    canvas.releasePointerCapture(e.pointerId);
+  });
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    orbitDistance = Math.max(1.5, Math.min(20, orbitDistance + e.deltaY * 0.01));
+  }, { passive: false });
+
   function render() {
     const aspect = canvas.clientWidth / canvas.clientHeight;
     mat4.perspective(projectionMatrix, (2 * Math.PI) / 5, aspect, 0.1, 100.0);
-    
-    // 45 degrees from top
-    const distance = 6;
-    const pos = distance * Math.cos(Math.PI / 4);
-    mat4.lookAt(viewMatrix, [pos, distance, pos], [0, 0, 0], [0, 1, 0]);
+
+    // Camera position from spherical coordinates
+    const camX = orbitDistance * Math.sin(orbitPhi) * Math.cos(orbitTheta);
+    const camY = orbitDistance * Math.cos(orbitPhi);
+    const camZ = orbitDistance * Math.sin(orbitPhi) * Math.sin(orbitTheta);
+    const cameraPos = [camX, camY, camZ];
+    mat4.lookAt(viewMatrix, cameraPos, [0, 0, 0], [0, 1, 0]);
 
     mat4.multiply(modelViewProjectionMatrix, projectionMatrix, viewMatrix);
 
@@ -342,8 +429,8 @@ async function init() {
     mat4.multiply(viewProjectionMatrix, projectionMatrix, viewMatrix);
     mat4.invert(inverseViewProjectionMatrix, viewProjectionMatrix);
     device.queue.writeBuffer(volumeUniformBuffer, 0, inverseViewProjectionMatrix);
-    const cameraPos = [pos, distance, pos];
-    device.queue.writeBuffer(volumeUniformBuffer, 64, new Float32Array([cameraPos[0], cameraPos[1], cameraPos[2], 0.0]));
+    device.queue.writeBuffer(volumeUniformBuffer, 64, new Float32Array([cameraPos[0], cameraPos[1], cameraPos[2]]));
+    device.queue.writeBuffer(volumeUniformBuffer, 76, new Uint32Array([sphereCount]));
 
     const commandEncoder = device.createCommandEncoder();
     const textureView = context.getCurrentTexture().createView();

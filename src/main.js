@@ -25,6 +25,106 @@ fn fs_main() -> @location(0) vec4<f32> {
 }
 `;
 
+const volumeShaderCode = `
+struct VolumeUniforms {
+  inverseViewProjection : mat4x4<f32>,
+  cameraPosition : vec3<f32>,
+};
+
+@binding(0) @group(0) var<uniform> volumeUniforms : VolumeUniforms;
+
+struct VertexOutput {
+  @builtin(position) Position : vec4<f32>,
+  @location(0) ndc : vec2<f32>,
+};
+
+@vertex
+fn vs_volume(@builtin(vertex_index) vertexIndex : u32) -> VertexOutput {
+  // Full-screen quad from 6 vertices (2 triangles)
+  var pos = array<vec2<f32>, 6>(
+    vec2(-1.0, -1.0),
+    vec2( 1.0, -1.0),
+    vec2(-1.0,  1.0),
+    vec2(-1.0,  1.0),
+    vec2( 1.0, -1.0),
+    vec2( 1.0,  1.0),
+  );
+  var output : VertexOutput;
+  output.Position = vec4(pos[vertexIndex], 0.0, 1.0);
+  output.ndc = pos[vertexIndex];
+  return output;
+}
+
+fn intersectAABB(origin : vec3<f32>, dir : vec3<f32>, boxMin : vec3<f32>, boxMax : vec3<f32>) -> vec2<f32> {
+  let invDir = 1.0 / dir;
+  let t1 = (boxMin - origin) * invDir;
+  let t2 = (boxMax - origin) * invDir;
+  let tMin = min(t1, t2);
+  let tMax = max(t1, t2);
+  let tNear = max(max(tMin.x, tMin.y), tMin.z);
+  let tFar = min(min(tMax.x, tMax.y), tMax.z);
+  return vec2(tNear, tFar);
+}
+
+fn sampleDensity(p : vec3<f32>) -> f32 {
+  // Sphere SDF at origin, radius 0.5
+  let dist = length(p) - 0.5;
+  // Soft edge: density transitions from 1 (inside) to 0 (outside) over ~0.2 range
+  return smoothstep(0.1, -0.1, dist);
+}
+
+@fragment
+fn fs_volume(@location(0) ndc : vec2<f32>) -> @location(0) vec4<f32> {
+  // Unproject NDC to world-space ray
+  let nearPoint = volumeUniforms.inverseViewProjection * vec4(ndc, -1.0, 1.0);
+  let farPoint = volumeUniforms.inverseViewProjection * vec4(ndc, 1.0, 1.0);
+  let nearWorld = nearPoint.xyz / nearPoint.w;
+  let farWorld = farPoint.xyz / farPoint.w;
+
+  let rayOrigin = volumeUniforms.cameraPosition;
+  let rayDir = normalize(farWorld - nearWorld);
+
+  // Intersect with [-1,1]^3 bounding box
+  let boxMin = vec3(-1.0, -1.0, -1.0);
+  let boxMax = vec3(1.0, 1.0, 1.0);
+  let t = intersectAABB(rayOrigin, rayDir, boxMin, boxMax);
+
+  if (t.x > t.y || t.y < 0.0) {
+    // Ray misses the box
+    return vec4(0.0, 0.0, 0.0, 0.0);
+  }
+
+  let tNear = max(t.x, 0.0);
+  let tFar = t.y;
+
+  // Raymarch through the volume
+  let numSteps = 64;
+  let stepSize = (tFar - tNear) / f32(numSteps);
+  var transmittance = 1.0;
+  let absorptionCoeff = 6.0;
+
+  for (var i = 0; i < numSteps; i++) {
+    let tCurrent = tNear + (f32(i) + 0.5) * stepSize;
+    let samplePos = rayOrigin + rayDir * tCurrent;
+    let density = sampleDensity(samplePos);
+
+    if (density > 0.0) {
+      // Beer's Law absorption
+      transmittance *= exp(-density * absorptionCoeff * stepSize);
+    }
+
+    // Early exit when nearly fully opaque
+    if (transmittance < 0.01) {
+      transmittance = 0.0;
+      break;
+    }
+  }
+
+  let alpha = 1.0 - transmittance;
+  return vec4(1.0, 1.0, 1.0, alpha);
+}
+`;
+
 async function init() {
   const canvas = document.getElementById('webgpu-canvas');
   if (!navigator.gpu) {
@@ -162,6 +262,59 @@ async function init() {
   const cubeUniforms = createUniformBindGroup();
   const gridUniforms = createUniformBindGroup();
 
+  // Volume raymarching pipeline
+  const volumeShaderModule = device.createShaderModule({
+    code: volumeShaderCode,
+  });
+
+  const volumePipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: {
+      module: volumeShaderModule,
+      entryPoint: 'vs_volume',
+      buffers: [],
+    },
+    fragment: {
+      module: volumeShaderModule,
+      entryPoint: 'fs_volume',
+      targets: [
+        {
+          format: canvasFormat,
+          blend: {
+            color: {
+              srcFactor: 'src-alpha',
+              dstFactor: 'one-minus-src-alpha',
+              operation: 'add',
+            },
+            alpha: {
+              srcFactor: 'one',
+              dstFactor: 'one-minus-src-alpha',
+              operation: 'add',
+            },
+          },
+          writeMask: GPUColorWrite.ALL,
+        },
+      ],
+    },
+    primitive: {
+      topology: 'triangle-list',
+    },
+  });
+
+  // Volume uniform buffer: mat4 (64 bytes) + vec3 padded to vec4 (16 bytes) = 80 bytes
+  const volumeUniformBuffer = device.createBuffer({
+    size: 80,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  const volumeBindGroup = device.createBindGroup({
+    layout: volumePipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: volumeUniformBuffer } }],
+  });
+
+  const viewProjectionMatrix = mat4.create();
+  const inverseViewProjectionMatrix = mat4.create();
+
   const projectionMatrix = mat4.create();
   const viewMatrix = mat4.create();
   const modelViewProjectionMatrix = mat4.create();
@@ -184,6 +337,13 @@ async function init() {
     // Update Grid Uniforms
     device.queue.writeBuffer(gridUniforms.buffer, 0, modelViewProjectionMatrix);
     device.queue.writeBuffer(gridUniforms.buffer, 64, new Float32Array([0.5, 0.5, 0.5, 1.0]));
+
+    // Update Volume Uniforms
+    mat4.multiply(viewProjectionMatrix, projectionMatrix, viewMatrix);
+    mat4.invert(inverseViewProjectionMatrix, viewProjectionMatrix);
+    device.queue.writeBuffer(volumeUniformBuffer, 0, inverseViewProjectionMatrix);
+    const cameraPos = [pos, distance, pos];
+    device.queue.writeBuffer(volumeUniformBuffer, 64, new Float32Array([cameraPos[0], cameraPos[1], cameraPos[2], 0.0]));
 
     const commandEncoder = device.createCommandEncoder();
     const textureView = context.getCurrentTexture().createView();
@@ -213,7 +373,12 @@ async function init() {
     passEncoder.setIndexBuffer(indexBuffer, 'uint16');
     passEncoder.setBindGroup(0, cubeUniforms.bindGroup);
     passEncoder.drawIndexed(indices.length);
-    
+
+    // Draw Volume (raymarched fog)
+    passEncoder.setPipeline(volumePipeline);
+    passEncoder.setBindGroup(0, volumeBindGroup);
+    passEncoder.draw(6);
+
     passEncoder.end();
 
     device.queue.submit([commandEncoder.finish()]);

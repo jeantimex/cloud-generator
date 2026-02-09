@@ -268,7 +268,7 @@ From `blender_shader_dump_props.json`, we can mirror the exact node settings:
   > *Outcome:* Adaptive stepping: SDF distance used to skip empty space (`tCurrent += sdfDist * 0.8`), fixed small steps only inside/near cloud. Early exit when transmittance < 1%. GUI: Render Steps (16–128), Light Steps (1–16) for quality/performance tradeoff.
 - [x] Add Surface/Volume render mode toggle.
   > *Outcome:* "Render Mode" dropdown in Lighting folder. Surface = original sphere tracer with sharp edges and normal-based shading. Volume = Beer's Law volumetric with soft edges and self-shadowing. Allows comparing both styles.
-- [ ] Add optional "dual-volume" style shading (two anisotropy settings) to mimic
+- [x] Add optional "dual-volume" style shading (two anisotropy settings) to mimic
       the Blender group behavior.
   > *Outcome:* Two Henyey-Greenstein phase functions (anisotropy ~0.5 and ~0.9) are evaluated and blended. The low-anisotropy term provides soft, diffuse in-scattering. The high-anisotropy term creates a bright forward-scattering halo (silver lining) when viewed near the sun direction. Combined, they produce the characteristic dual-tone look of the Blender reference.
 
@@ -291,7 +291,8 @@ From `blender_shader_dump_props.json`, we can mirror the exact node settings:
 - [x] ~~Phase 2e (Density Gradient) — vertical density falloff + auto-fitting bounding box.~~
 - [x] ~~Phase 3 (Noise & Detail) — 3D noise, fBm, billowy + wispy noise, coverage, Z-shaping.~~
 - [x] ~~Phase 4 (Lighting) — Beer's Law, sun light, light marching, adaptive stepping, render mode toggle.~~
-- **Next Step:** Phase 4 remaining — dual-volume shading (Henyey-Greenstein silver lining).
+- [x] ~~Phase 4 remaining — dual-volume shading (Henyey-Greenstein silver lining).~~
+- **Next Step:** Phase 5 (Interaction) — additional UI controls.
 
 ---
 

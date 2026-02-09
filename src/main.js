@@ -253,9 +253,11 @@ struct VolumeUniforms {
   renderSteps : f32,
   lightSteps : f32,
   renderMode : f32,
-  padding0 : f32,
-  padding1 : f32,
-  padding2 : f32,
+  anisotropy1 : f32,
+  anisotropy2 : f32,
+  phaseBlend : f32,
+  lightDir : vec3<f32>,
+  _pad : f32,
 };
 
 @binding(0) @group(0) var<uniform> volumeUniforms : VolumeUniforms;
@@ -414,6 +416,18 @@ fn calcNormal(p : vec3<f32>) -> vec3<f32> {
   return normalize(n);
 }
 
+fn henyeyGreenstein(cosTheta : f32, g : f32) -> f32 {
+  let g2 = g * g;
+  let denom = 1.0 + g2 - 2.0 * g * cosTheta;
+  return (1.0 - g2) / (4.0 * 3.14159265 * pow(denom, 1.5));
+}
+
+fn dualPhase(cosTheta : f32) -> f32 {
+  let hg1 = henyeyGreenstein(cosTheta, volumeUniforms.anisotropy1);
+  let hg2 = henyeyGreenstein(cosTheta, volumeUniforms.anisotropy2);
+  return mix(hg1, hg2, volumeUniforms.phaseBlend);
+}
+
 fn lightMarch(pos : vec3<f32>, lightDir : vec3<f32>, absorption : f32) -> f32 {
   // March toward the light to estimate how much cloud is in the way
   let numSteps = i32(volumeUniforms.lightSteps);
@@ -447,7 +461,7 @@ fn fs_volume(@location(0) ndc : vec2<f32>) -> @location(0) vec4<f32> {
 
   let tNear = max(t.x, 0.0);
   let tFar = t.y;
-  let lightDir = normalize(vec3(1.0, 1.0, 0.5));
+  let lightDir = normalize(volumeUniforms.lightDir);
 
   // Surface mode: sphere tracing with normal-based shading
   if (volumeUniforms.renderMode < 0.5) {
@@ -504,9 +518,16 @@ fn fs_volume(@location(0) ndc : vec2<f32>) -> @location(0) vec4<f32> {
       let attenuation = exp(-density * denseStepSize * absorption);
       let lightTransmittance = lightMarch(pos, lightDir, absorption);
 
+      // Henyey-Greenstein phase function for anisotropic scattering
+      let cosTheta = dot(rayDir, lightDir);
+      let phase = dualPhase(cosTheta) * 4.0 * 3.14159265;
+
+      // Base lighting (same as pre-phase): always present
       let ambient = 0.3;
       let directional = lightTransmittance * 0.7;
-      let luminance = ambient + directional;
+      // Silver lining boost: phase > 1 adds extra brightness (forward scattering)
+      let phaseBoost = lightTransmittance * max(phase - 1.0, 0.0) * 0.7;
+      let luminance = ambient + directional + phaseBoost;
       let shade = luminance * cloudColor;
 
       accColor += shade * density * denseStepSize * absorption * transmittance;
@@ -688,9 +709,9 @@ async function init() {
     },
   });
 
-  // Volume uniform buffer: 176 bytes (see VolumeUniforms struct)
+  // Volume uniform buffer: 192 bytes (see VolumeUniforms struct)
   const volumeUniformBuffer = device.createBuffer({
-    size: 176,
+    size: 192,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
@@ -769,6 +790,12 @@ async function init() {
     renderSteps: 64,
     lightSteps: 6,
     renderMode: 'Volume',
+    anisotropy1: 0.5,
+    anisotropy2: -0.3,
+    phaseBlend: 0.5,
+    sunX: 1.0,
+    sunY: 1.0,
+    sunZ: 0.5,
     blendMode: 'Sharp',
     smoothness: 0.3,
   };
@@ -830,6 +857,12 @@ async function init() {
   lightingFolder.add(params, 'absorption', 1.0, 20.0, 0.5).name('Absorption');
   lightingFolder.add(params, 'renderSteps', 16, 128, 1).name('Render Steps');
   lightingFolder.add(params, 'lightSteps', 1, 16, 1).name('Light Steps');
+  lightingFolder.add(params, 'sunX', -1.0, 1.0, 0.01).name('Sun X');
+  lightingFolder.add(params, 'sunY', -1.0, 1.0, 0.01).name('Sun Y');
+  lightingFolder.add(params, 'sunZ', -1.0, 1.0, 0.01).name('Sun Z');
+  lightingFolder.add(params, 'anisotropy1', -0.99, 0.99, 0.01).name('Anisotropy 1');
+  lightingFolder.add(params, 'anisotropy2', -0.99, 0.99, 0.01).name('Anisotropy 2');
+  lightingFolder.add(params, 'phaseBlend', 0.0, 1.0, 0.01).name('Phase Blend');
 
   gui.add(params, 'blendMode', ['Sharp', 'Smooth']).name('Blend Mode');
   gui.add(params, 'smoothness', 0.05, 1.0, 0.01).name('Smoothness');
@@ -911,7 +944,10 @@ async function init() {
       params.flipZ ? 1.0 : 0.0, params.absorption, params.renderSteps, params.lightSteps,
     ]));
     device.queue.writeBuffer(volumeUniformBuffer, 160, new Float32Array([
-      params.renderMode === 'Volume' ? 1.0 : 0.0, 0.0, 0.0, 0.0,
+      params.renderMode === 'Volume' ? 1.0 : 0.0, params.anisotropy1, params.anisotropy2, params.phaseBlend,
+    ]));
+    device.queue.writeBuffer(volumeUniformBuffer, 176, new Float32Array([
+      params.sunX, params.sunY, params.sunZ, 0.0,
     ]));
 
     const commandEncoder = device.createCommandEncoder();

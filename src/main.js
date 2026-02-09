@@ -1,4 +1,86 @@
 import { mat4 } from 'gl-matrix';
+import GUI from 'lil-gui';
+
+// Seeded PRNG (mulberry32)
+function createRNG(seed) {
+  return function() {
+    seed |= 0;
+    seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = t + Math.imul(t ^ (t >>> 7), 61 | t) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function generateCloudSpheres(options = {}) {
+  const {
+    gridX = 4,
+    gridZ = 4,
+    pointSeparation = 0.25,
+    flattenBottom = -0.3,
+    seed = 42,
+    replicationIterations = 2,
+    childrenPerSphere = 4,
+    keepProbability = 0.5,
+    scaleMult = 0.55,
+  } = options;
+
+  const rng = createRNG(seed);
+  const spheres = [];
+
+  // Phase 2b: Grid generation with jitter
+  const halfX = (gridX - 1) * pointSeparation / 2;
+  const halfZ = (gridZ - 1) * pointSeparation / 2;
+
+  for (let ix = 0; ix < gridX; ix++) {
+    for (let iz = 0; iz < gridZ; iz++) {
+      let x = ix * pointSeparation - halfX + (rng() * 2 - 1) * pointSeparation;
+      let y = (rng() * 2 - 1) * pointSeparation;
+      let z = iz * pointSeparation - halfZ + (rng() * 2 - 1) * pointSeparation;
+
+      // Flatten bottom
+      if (y < flattenBottom) y = flattenBottom;
+
+      const radius = pointSeparation * (0.90 + rng() * 0.52); // 0.90–1.42
+      spheres.push(x, y, z, radius);
+    }
+  }
+
+  // Phase 2c: Sphere replication
+  let prevStart = 0;
+  let prevCount = spheres.length / 4;
+
+  for (let iter = 0; iter < replicationIterations; iter++) {
+    const newStart = spheres.length;
+
+    for (let i = 0; i < prevCount; i++) {
+      const si = (prevStart + i) * 4;
+      const px = spheres[si], py = spheres[si + 1], pz = spheres[si + 2], pr = spheres[si + 3];
+
+      for (let c = 0; c < childrenPerSphere; c++) {
+        if (rng() > keepProbability) continue;
+
+        // Uniform random direction on sphere surface
+        const u = rng() * 2 - 1;
+        const theta = rng() * Math.PI * 2;
+        const sinPhi = Math.sqrt(1 - u * u);
+
+        const childRadius = pr * scaleMult;
+        spheres.push(
+          px + sinPhi * Math.cos(theta) * pr,
+          py + sinPhi * Math.sin(theta) * pr,
+          pz + u * pr,
+          childRadius,
+        );
+      }
+    }
+
+    prevStart = newStart / 4;
+    prevCount = (spheres.length - newStart) / 4;
+  }
+
+  return new Float32Array(spheres);
+}
 
 const shaderCode = `
 struct Uniforms {
@@ -30,6 +112,7 @@ struct VolumeUniforms {
   inverseViewProjection : mat4x4<f32>,
   cameraPosition : vec3<f32>,
   sphereCount : u32,
+  smoothness : f32,
 };
 
 @binding(0) @group(0) var<uniform> volumeUniforms : VolumeUniforms;
@@ -78,11 +161,16 @@ fn smin(a : f32, b : f32, k : f32) -> f32 {
 }
 
 fn cloudSDF(p : vec3<f32>) -> f32 {
-  let k = 0.3; // smoothness factor
+  let k = volumeUniforms.smoothness;
   var d = 1e10;
   for (var i = 0u; i < volumeUniforms.sphereCount; i++) {
     let s = spheres[i];
-    d = smin(d, sphereSDF(p, s.xyz, s.w), k);
+    let sd = sphereSDF(p, s.xyz, s.w);
+    if (k > 0.0) {
+      d = smin(d, sd, k);
+    } else {
+      d = min(d, sd);
+    }
   }
   return d;
 }
@@ -334,22 +422,16 @@ async function init() {
     },
   });
 
-  // Volume uniform buffer: mat4 (64 bytes) + vec3 cameraPosition (12) + u32 sphereCount (4) = 80 bytes
+  // Volume uniform buffer: mat4 (64) + vec3 (12) + u32 (4) + f32 (4) = 84 → padded to 96
   const volumeUniformBuffer = device.createBuffer({
-    size: 80,
+    size: 96,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
-  // Test spheres: vec4 each (xyz = center, w = radius)
-  const sphereData = new Float32Array([
-    // x,    y,    z,    radius
-     0.0,  0.0,  0.0,  0.4,   // large center sphere
-     0.35, 0.15, 0.0,  0.3,   // right
-    -0.3,  0.05, 0.15, 0.25,  // left-front
-     0.05, 0.4, -0.1,  0.25,  // top
-     0.1, -0.15, 0.35, 0.2,   // front-bottom
-  ]);
+  // Generate cloud spheres (Phase 2b grid + Phase 2c replication)
+  const sphereData = generateCloudSpheres();
   const sphereCount = sphereData.length / 4;
+  console.log(`Generated ${sphereCount} spheres`);
 
   const sphereBuffer = device.createBuffer({
     size: sphereData.byteLength,
@@ -371,6 +453,15 @@ async function init() {
   const projectionMatrix = mat4.create();
   const viewMatrix = mat4.create();
   const modelViewProjectionMatrix = mat4.create();
+
+  // GUI
+  const params = {
+    blendMode: 'Sharp',
+    smoothness: 0.3,
+  };
+  const gui = new GUI();
+  gui.add(params, 'blendMode', ['Sharp', 'Smooth']).name('Blend Mode');
+  gui.add(params, 'smoothness', 0.05, 1.0, 0.01).name('Smoothness');
 
   // Orbit camera state
   let orbitTheta = Math.PI / 4;   // horizontal angle
@@ -431,6 +522,8 @@ async function init() {
     device.queue.writeBuffer(volumeUniformBuffer, 0, inverseViewProjectionMatrix);
     device.queue.writeBuffer(volumeUniformBuffer, 64, new Float32Array([cameraPos[0], cameraPos[1], cameraPos[2]]));
     device.queue.writeBuffer(volumeUniformBuffer, 76, new Uint32Array([sphereCount]));
+    const smoothnessValue = params.blendMode === 'Smooth' ? params.smoothness : 0.0;
+    device.queue.writeBuffer(volumeUniformBuffer, 80, new Float32Array([smoothnessValue]));
 
     const commandEncoder = device.createCommandEncoder();
     const textureView = context.getCurrentTexture().createView();

@@ -258,14 +258,16 @@ From `blender_shader_dump_props.json`, we can mirror the exact node settings:
 > **Phase 3 Expected Outcome:** The smooth sphere-blob cloud from Phase 2 transforms into a realistic, detailed cloud. Large-scale "billowy" noise creates dramatic rolling shapes and deep cavities in the silhouette. Fine "wispy" noise adds soft, fuzzy edges that dissolve into the air. Three noise scales (big ~0.1, mid ~4.12, small ~12.0) layer together for multi-frequency detail. The `Coverage` parameter controls overall cloud size (more coverage = puffier), `Billowy Factor` controls the intensity of large deformations, and Z-shaping parameters sculpt the vertical profile. The result closely matches the Blender CloudCreatorPro reference — a photorealistic cloud silhouette with organic, non-repeating detail.
 
 ### Phase 4: Lighting & Refinement
-- [ ] Implement Beer's Law for light absorption (translucency).
-  > *Outcome:* Light transmittance through the cloud follows `exp(-absorption * density * distance)`. Dense regions appear darker/more opaque when lit from behind; thin regions glow with transmitted light. This replaces the current uniform white color with physically-based attenuation.
-- [ ] Add a simple "Sun" light source.
-  > *Outcome:* A directional light defined by a `lightDirection` uniform vector and `lightColor`. The cloud's illumination varies across its surface — the sun-facing side is bright, the opposite side is in shadow.
-- [ ] Implement "directional scattering" (sampling density towards the light).
-  > *Outcome:* At each raymarch sample, a secondary march toward the light direction estimates how much cloud material the light must pass through to reach that point. Points deep inside or on the shadow side receive less light; points near the sun-facing surface receive full illumination. This creates realistic self-shadowing within the cloud.
-- [ ] Optimize step size and performance.
-  > *Outcome:* Adaptive step sizing: large steps through empty space (low density), smaller steps in dense regions for accuracy. Optional early-exit refinements and reduced light-march step counts. Target: interactive frame rates (30+ FPS) with ~200 spheres and noise.
+- [x] Implement Beer's Law for light absorption (translucency).
+  > *Outcome:* Switched from surface tracing to volumetric raymarching. 64 fixed steps accumulate density via `exp(-density * stepSize * absorption)`. Thin areas are translucent, dense areas opaque. GUI: Absorption slider (1–20).
+- [x] Add a simple "Sun" light source.
+  > *Outcome:* Directional light at `normalize(1, 1, 0.5)`. Used in both Surface mode (normal-based diffuse) and Volume mode (light marching). 30% ambient + 70% directional.
+- [x] Implement "directional scattering" (sampling density towards the light).
+  > *Outcome:* `lightMarch()` takes 6 steps toward the light direction from each sample point, accumulating density to estimate shadow. Beer's Law applied to get light transmittance. Creates realistic self-shadowing — sun-facing surfaces bright, deep interior dark.
+- [x] Optimize step size and performance.
+  > *Outcome:* Adaptive stepping: SDF distance used to skip empty space (`tCurrent += sdfDist * 0.8`), fixed small steps only inside/near cloud. Early exit when transmittance < 1%. GUI: Render Steps (16–128), Light Steps (1–16) for quality/performance tradeoff.
+- [x] Add Surface/Volume render mode toggle.
+  > *Outcome:* "Render Mode" dropdown in Lighting folder. Surface = original sphere tracer with sharp edges and normal-based shading. Volume = Beer's Law volumetric with soft edges and self-shadowing. Allows comparing both styles.
 - [ ] Add optional "dual-volume" style shading (two anisotropy settings) to mimic
       the Blender group behavior.
   > *Outcome:* Two Henyey-Greenstein phase functions (anisotropy ~0.5 and ~0.9) are evaluated and blended. The low-anisotropy term provides soft, diffuse in-scattering. The high-anisotropy term creates a bright forward-scattering halo (silver lining) when viewed near the sun direction. Combined, they produce the characteristic dual-tone look of the Blender reference.
@@ -288,7 +290,8 @@ From `blender_shader_dump_props.json`, we can mirror the exact node settings:
 - [x] ~~Phase 2d (Shape Modes) — Cumulus/Wispy/Ellipsoid with lil-gui switching.~~
 - [x] ~~Phase 2e (Density Gradient) — vertical density falloff + auto-fitting bounding box.~~
 - [x] ~~Phase 3 (Noise & Detail) — 3D noise, fBm, billowy + wispy noise, coverage, Z-shaping.~~
-- **Next Step:** Phase 4 (Lighting & Refinement) — Beer's Law, sun light, directional scattering.
+- [x] ~~Phase 4 (Lighting) — Beer's Law, sun light, light marching, adaptive stepping, render mode toggle.~~
+- **Next Step:** Phase 4 remaining — dual-volume shading (Henyey-Greenstein silver lining).
 
 ---
 

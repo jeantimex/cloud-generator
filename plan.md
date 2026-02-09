@@ -252,8 +252,8 @@ From `blender_shader_dump_props.json`, we can mirror the exact node settings:
 - [x] Match Blender controls: `Coverage`, `Billowy Factor`, and multi-scale noise blend
       (`Big Scale`, `Mid Scale`, `Small Scale`).
   > *Outcome:* `Coverage` uniform shifts the entire SDF inward/outward (`d -= coverage`). Positive = puffier, negative = eroded. Two noise layers (billowy + wispy) with independent scale/strength. GUI: Coverage (-0.5 to 0.5).
-- [ ] Add a Z-based shaping block: `Zpadding`, `ZBlur`, `Z Offset`, and `FlipZ`.
-  > *Outcome:* A vertical gradient mask is applied to the density. `Z Offset` shifts the gradient up/down, `ZBlur` controls the transition softness, `Zpadding` adds a buffer zone at the top/bottom, and `FlipZ` inverts the gradient direction. This sculpts the cloud's vertical profile independently of the noise.
+- [x] Add a Z-based shaping block: `Zpadding` and `FlipZ`.
+  > *Outcome:* `zPadding` clips the cloud at top/bottom bounds using smoothstep masks — pushes SDF outward near the bounding box edges, trimming the cloud. `flipZ` inverts the gradient direction (erode bottom instead of top). Both added to the "Density Gradient" GUI folder. Z Offset and ZBlur already covered by existing Bottom/Top/Strength controls.
 
 > **Phase 3 Expected Outcome:** The smooth sphere-blob cloud from Phase 2 transforms into a realistic, detailed cloud. Large-scale "billowy" noise creates dramatic rolling shapes and deep cavities in the silhouette. Fine "wispy" noise adds soft, fuzzy edges that dissolve into the air. Three noise scales (big ~0.1, mid ~4.12, small ~12.0) layer together for multi-frequency detail. The `Coverage` parameter controls overall cloud size (more coverage = puffier), `Billowy Factor` controls the intensity of large deformations, and Z-shaping parameters sculpt the vertical profile. The result closely matches the Blender CloudCreatorPro reference — a photorealistic cloud silhouette with organic, non-repeating detail.
 
@@ -287,8 +287,8 @@ From `blender_shader_dump_props.json`, we can mirror the exact node settings:
 - [x] ~~Phase 2c (Replication) — iterative child sphere scattering.~~
 - [x] ~~Phase 2d (Shape Modes) — Cumulus/Wispy/Ellipsoid with lil-gui switching.~~
 - [x] ~~Phase 2e (Density Gradient) — vertical density falloff + auto-fitting bounding box.~~
-- **Next Step:** Phase 3 (Noise & Detail) — 3D noise in WGSL, fBm, billowy + wispy noise layers.
-- **Then:** Phase 4 (Lighting & Refinement) — Beer's Law, sun light, directional scattering.
+- [x] ~~Phase 3 (Noise & Detail) — 3D noise, fBm, billowy + wispy noise, coverage, Z-shaping.~~
+- **Next Step:** Phase 4 (Lighting & Refinement) — Beer's Law, sun light, directional scattering.
 
 ---
 

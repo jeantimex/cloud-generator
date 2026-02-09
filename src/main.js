@@ -247,7 +247,11 @@ struct VolumeUniforms {
   wispyScale : f32,
   wispyStrength : f32,
   coverage : f32,
+  zPadding : f32,
+  flipZ : f32,
   padding0 : f32,
+  padding1 : f32,
+  padding2 : f32,
 };
 
 @binding(0) @group(0) var<uniform> volumeUniforms : VolumeUniforms;
@@ -349,10 +353,14 @@ fn cloudSDF(p : vec3<f32>) -> f32 {
     }
   }
 
-  // Density gradient: erode the SDF at higher Y values
+  // Density gradient: erode the SDF based on height
   let gStrength = volumeUniforms.gradientStrength;
   if (gStrength > 0.0) {
-    let heightFrac = smoothstep(volumeUniforms.gradientBottom, volumeUniforms.gradientTop, p.y);
+    var heightFrac = smoothstep(volumeUniforms.gradientBottom, volumeUniforms.gradientTop, p.y);
+    // FlipZ: erode bottom instead of top
+    if (volumeUniforms.flipZ > 0.5) {
+      heightFrac = 1.0 - heightFrac;
+    }
     d += heightFrac * gStrength;
   }
 
@@ -372,6 +380,17 @@ fn cloudSDF(p : vec3<f32>) -> f32 {
 
   // Coverage: shift the entire SDF inward (negative = puffier)
   d -= volumeUniforms.coverage;
+
+  // Z-padding: clip cloud at top/bottom by pushing SDF outward near bounds
+  let zPad = volumeUniforms.zPadding;
+  if (zPad > 0.0) {
+    let bMin = volumeUniforms.boxMin.y;
+    let bMax = volumeUniforms.boxMax.y;
+    let clipBottom = smoothstep(bMin, bMin + zPad, p.y);
+    let clipTop = smoothstep(bMax, bMax - zPad, p.y);
+    let clipMask = clipBottom * clipTop;
+    d += (1.0 - clipMask) * 0.5;
+  }
 
   return d;
 }
@@ -609,9 +628,9 @@ async function init() {
     },
   });
 
-  // Volume uniform buffer: 144 bytes (see VolumeUniforms struct)
+  // Volume uniform buffer: 160 bytes (see VolumeUniforms struct)
   const volumeUniformBuffer = device.createBuffer({
-    size: 144,
+    size: 160,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
@@ -684,6 +703,8 @@ async function init() {
     wispyScale: 8.0,
     wispyStrength: 0.0,
     coverage: 0.0,
+    zPadding: 0.0,
+    flipZ: false,
     blendMode: 'Sharp',
     smoothness: 0.3,
   };
@@ -730,6 +751,8 @@ async function init() {
   gradientFolder.add(params, 'gradientBottom', -1.0, 1.0, 0.05).name('Bottom');
   gradientFolder.add(params, 'gradientTop', -1.0, 1.0, 0.05).name('Top');
   gradientFolder.add(params, 'gradientStrength', 0.0, 1.0, 0.01).name('Strength');
+  gradientFolder.add(params, 'zPadding', 0.0, 1.0, 0.01).name('Z Padding');
+  gradientFolder.add(params, 'flipZ').name('Flip Z');
 
   const noiseFolder = gui.addFolder('Noise');
   noiseFolder.add(params, 'billowyScale', 0.5, 5.0, 0.1).name('Billowy Scale');
@@ -812,9 +835,10 @@ async function init() {
     device.queue.writeBuffer(volumeUniformBuffer, 112, new Float32Array([
       ...cloudBounds.max, params.billowyStrength,
     ]));
-    // wispyScale, wispyStrength, coverage, padding
+    // wispyScale, wispyStrength, coverage, zPadding, flipZ, padding...
     device.queue.writeBuffer(volumeUniformBuffer, 128, new Float32Array([
-      params.wispyScale, params.wispyStrength, params.coverage, 0.0,
+      params.wispyScale, params.wispyStrength, params.coverage, params.zPadding,
+      params.flipZ ? 1.0 : 0.0, 0.0, 0.0, 0.0,
     ]));
 
     const commandEncoder = device.createCommandEncoder();

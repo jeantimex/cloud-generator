@@ -177,6 +177,35 @@ function generateEllipsoid(options = {}) {
   });
 }
 
+function computeBounds(sphereData, padding = 0.15) {
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  for (let i = 0; i < sphereData.length; i += 4) {
+    const x = sphereData[i], y = sphereData[i + 1], z = sphereData[i + 2], r = sphereData[i + 3];
+    minX = Math.min(minX, x - r); minY = Math.min(minY, y - r); minZ = Math.min(minZ, z - r);
+    maxX = Math.max(maxX, x + r); maxY = Math.max(maxY, y + r); maxZ = Math.max(maxZ, z + r);
+  }
+  return {
+    min: [minX - padding, minY - padding, minZ - padding],
+    max: [maxX + padding, maxY + padding, maxZ + padding],
+  };
+}
+
+function buildCubeVertices(bounds) {
+  const [x0, y0, z0] = bounds.min;
+  const [x1, y1, z1] = bounds.max;
+  return new Float32Array([
+    x0, y0, z1, 1.0,
+    x1, y0, z1, 1.0,
+    x1, y1, z1, 1.0,
+    x0, y1, z1, 1.0,
+    x0, y0, z0, 1.0,
+    x1, y0, z0, 1.0,
+    x1, y1, z0, 1.0,
+    x0, y1, z0, 1.0,
+  ]);
+}
+
 const shaderCode = `
 struct Uniforms {
   modelViewProjectionMatrix : mat4x4<f32>,
@@ -208,6 +237,11 @@ struct VolumeUniforms {
   cameraPosition : vec3<f32>,
   sphereCount : u32,
   smoothness : f32,
+  gradientBottom : f32,
+  gradientTop : f32,
+  gradientStrength : f32,
+  boxMin : vec3<f32>,
+  boxMax : vec3<f32>,
 };
 
 @binding(0) @group(0) var<uniform> volumeUniforms : VolumeUniforms;
@@ -267,6 +301,14 @@ fn cloudSDF(p : vec3<f32>) -> f32 {
       d = min(d, sd);
     }
   }
+
+  // Density gradient: erode the SDF at higher Y values
+  let gStrength = volumeUniforms.gradientStrength;
+  if (gStrength > 0.0) {
+    let heightFrac = smoothstep(volumeUniforms.gradientBottom, volumeUniforms.gradientTop, p.y);
+    d += heightFrac * gStrength;
+  }
+
   return d;
 }
 
@@ -296,10 +338,8 @@ fn fs_volume(@location(0) ndc : vec2<f32>) -> @location(0) vec4<f32> {
   let rayOrigin = volumeUniforms.cameraPosition;
   let rayDir = normalize(farWorld - nearWorld);
 
-  // Intersect with [-1,1]^3 bounding box
-  let boxMin = vec3(-1.0, -1.0, -1.0);
-  let boxMax = vec3(1.0, 1.0, 1.0);
-  let t = intersectAABB(rayOrigin, rayDir, boxMin, boxMax);
+  // Intersect with dynamic bounding box
+  let t = intersectAABB(rayOrigin, rayDir, volumeUniforms.boxMin, volumeUniforms.boxMax);
 
   if (t.x > t.y || t.y < 0.0) {
     return vec4(0.0, 0.0, 0.0, 0.0);
@@ -363,23 +403,11 @@ async function init() {
     alphaMode: 'premultiplied',
   });
 
-  // Cube vertices (x, y, z, w)
-  const vertices = new Float32Array([
-    -1.0, -1.0,  1.0, 1.0,
-     1.0, -1.0,  1.0, 1.0,
-     1.0,  1.0,  1.0, 1.0,
-    -1.0,  1.0,  1.0, 1.0,
-    -1.0, -1.0, -1.0, 1.0,
-     1.0, -1.0, -1.0, 1.0,
-     1.0,  1.0, -1.0, 1.0,
-    -1.0,  1.0, -1.0, 1.0,
-  ]);
-
+  // Cube vertices (will be updated to match cloud bounds)
   const vertexBuffer = device.createBuffer({
-    size: vertices.byteLength,
+    size: 8 * 4 * 4, // 8 vertices × 4 floats × 4 bytes
     usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
   });
-  device.queue.writeBuffer(vertexBuffer, 0, vertices);
 
   // Wireframe indices (pairs of vertices for lines)
   const indices = new Uint16Array([
@@ -517,16 +545,20 @@ async function init() {
     },
   });
 
-  // Volume uniform buffer: mat4 (64) + vec3 (12) + u32 (4) + f32 (4) = 84 → padded to 96
+  // Volume uniform buffer: mat4 (64) + vec3+u32 (16) + 4×f32 (16) + vec3 (16) + vec3 (16) = 128
   const volumeUniformBuffer = device.createBuffer({
-    size: 96,
+    size: 128,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
   // Generate cloud spheres
   let sphereData = generateCumulus();
   let sphereCount = sphereData.length / 4;
+  let cloudBounds = computeBounds(sphereData);
   console.log(`[Cumulus] Generated ${sphereCount} spheres`);
+
+  // Set initial cube wireframe from bounds
+  device.queue.writeBuffer(vertexBuffer, 0, buildCubeVertices(cloudBounds));
 
   let sphereBuffer = device.createBuffer({
     size: sphereData.byteLength,
@@ -546,6 +578,8 @@ async function init() {
     sphereBuffer.destroy();
     sphereData = data;
     sphereCount = data.length / 4;
+    cloudBounds = computeBounds(data);
+    device.queue.writeBuffer(vertexBuffer, 0, buildCubeVertices(cloudBounds));
     sphereBuffer = device.createBuffer({
       size: data.byteLength,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
@@ -578,6 +612,9 @@ async function init() {
     keepProb: 0.5,
     scaleMult: 0.55,
     seed: 42,
+    gradientBottom: -0.2,
+    gradientTop: 0.5,
+    gradientStrength: 0.0,
     blendMode: 'Sharp',
     smoothness: 0.3,
   };
@@ -619,6 +656,11 @@ async function init() {
   shapeFolder.add(params, 'keepProb', 0.1, 1.0, 0.05).name('Keep Prob').onChange(regenerate);
   shapeFolder.add(params, 'scaleMult', 0.2, 0.9, 0.05).name('Scale Mult').onChange(regenerate);
   shapeFolder.add(params, 'seed', 1, 100, 1).name('Seed').onChange(regenerate);
+
+  const gradientFolder = gui.addFolder('Density Gradient');
+  gradientFolder.add(params, 'gradientBottom', -1.0, 1.0, 0.05).name('Bottom');
+  gradientFolder.add(params, 'gradientTop', -1.0, 1.0, 0.05).name('Top');
+  gradientFolder.add(params, 'gradientStrength', 0.0, 1.0, 0.01).name('Strength');
 
   gui.add(params, 'blendMode', ['Sharp', 'Smooth']).name('Blend Mode');
   gui.add(params, 'smoothness', 0.05, 1.0, 0.01).name('Smoothness');
@@ -683,7 +725,11 @@ async function init() {
     device.queue.writeBuffer(volumeUniformBuffer, 64, new Float32Array([cameraPos[0], cameraPos[1], cameraPos[2]]));
     device.queue.writeBuffer(volumeUniformBuffer, 76, new Uint32Array([sphereCount]));
     const smoothnessValue = params.blendMode === 'Smooth' ? params.smoothness : 0.0;
-    device.queue.writeBuffer(volumeUniformBuffer, 80, new Float32Array([smoothnessValue]));
+    device.queue.writeBuffer(volumeUniformBuffer, 80, new Float32Array([
+      smoothnessValue, params.gradientBottom, params.gradientTop, params.gradientStrength,
+    ]));
+    device.queue.writeBuffer(volumeUniformBuffer, 96, new Float32Array(cloudBounds.min));
+    device.queue.writeBuffer(volumeUniformBuffer, 112, new Float32Array(cloudBounds.max));
 
     const commandEncoder = device.createCommandEncoder();
     const textureView = context.getCurrentTexture().createView();

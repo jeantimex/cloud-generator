@@ -249,9 +249,9 @@ struct VolumeUniforms {
   coverage : f32,
   zPadding : f32,
   flipZ : f32,
+  absorption : f32,
   padding0 : f32,
   padding1 : f32,
-  padding2 : f32,
 };
 
 @binding(0) @group(0) var<uniform> volumeUniforms : VolumeUniforms;
@@ -431,36 +431,41 @@ fn fs_volume(@location(0) ndc : vec2<f32>) -> @location(0) vec4<f32> {
   let tNear = max(t.x, 0.0);
   let tFar = t.y;
 
-  // Sphere trace to find SDF surface
-  var tCurrent = tNear;
-  var hit = false;
-  for (var i = 0; i < 128; i++) {
-    if (tCurrent > tFar) { break; }
-    let p = rayOrigin + rayDir * tCurrent;
-    let d = cloudSDF(p);
-    if (d < 0.001) {
-      hit = true;
-      break;
+  // Volumetric raymarching with Beer's Law
+  let numSteps = 64;
+  let stepSize = (tFar - tNear) / f32(numSteps);
+  let absorption = volumeUniforms.absorption;
+
+  var transmittance = 1.0;
+  var accColor = vec3(0.0);
+  let lightDir = normalize(vec3(1.0, 1.0, 0.5));
+  let cloudColor = vec3(1.0, 1.0, 1.0);
+
+  for (var i = 0; i < numSteps; i++) {
+    if (transmittance < 0.01) { break; }
+
+    let tCurrent = tNear + (f32(i) + 0.5) * stepSize;
+    let pos = rayOrigin + rayDir * tCurrent;
+    let density = sampleDensity(pos);
+
+    if (density > 0.001) {
+      // Beer's Law: light attenuates exponentially through dense material
+      let attenuation = exp(-density * stepSize * absorption);
+
+      // Simple ambient + directional shading based on density gradient
+      let ambient = 0.4;
+      let shade = ambient + (1.0 - ambient) * cloudColor;
+
+      accColor += shade * density * stepSize * absorption * transmittance;
+      transmittance *= attenuation;
     }
-    tCurrent += max(d, 0.005); // min step to avoid getting stuck
   }
 
-  if (!hit) {
+  let alpha = 1.0 - transmittance;
+  if (alpha < 0.001) {
     return vec4(0.0, 0.0, 0.0, 0.0);
   }
-
-  // Shade the surface
-  let hitPos = rayOrigin + rayDir * tCurrent;
-  let normal = calcNormal(hitPos);
-
-  // Diffuse lighting from upper-right
-  let lightDir = normalize(vec3(1.0, 1.0, 0.5));
-  let diffuse = max(dot(normal, lightDir), 0.0);
-  let ambient = 0.3;
-  let shade = ambient + diffuse * 0.7;
-  let color = vec3(shade);
-
-  return vec4(color, 1.0);
+  return vec4(accColor, alpha);
 }
 `;
 
@@ -705,6 +710,7 @@ async function init() {
     coverage: 0.0,
     zPadding: 0.0,
     flipZ: false,
+    absorption: 5.0,
     blendMode: 'Sharp',
     smoothness: 0.3,
   };
@@ -760,6 +766,9 @@ async function init() {
   noiseFolder.add(params, 'wispyScale', 2.0, 20.0, 0.5).name('Wispy Scale');
   noiseFolder.add(params, 'wispyStrength', 0.0, 0.3, 0.01).name('Wispy Strength');
   noiseFolder.add(params, 'coverage', -0.5, 0.5, 0.01).name('Coverage');
+
+  const lightingFolder = gui.addFolder('Lighting');
+  lightingFolder.add(params, 'absorption', 1.0, 20.0, 0.5).name('Absorption');
 
   gui.add(params, 'blendMode', ['Sharp', 'Smooth']).name('Blend Mode');
   gui.add(params, 'smoothness', 0.05, 1.0, 0.01).name('Smoothness');
@@ -838,7 +847,7 @@ async function init() {
     // wispyScale, wispyStrength, coverage, zPadding, flipZ, padding...
     device.queue.writeBuffer(volumeUniformBuffer, 128, new Float32Array([
       params.wispyScale, params.wispyStrength, params.coverage, params.zPadding,
-      params.flipZ ? 1.0 : 0.0, 0.0, 0.0, 0.0,
+      params.flipZ ? 1.0 : 0.0, params.absorption, 0.0, 0.0,
     ]));
 
     const commandEncoder = device.createCommandEncoder();

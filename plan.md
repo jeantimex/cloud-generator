@@ -28,6 +28,48 @@ We will define a Density Function `D(p)` where `p` is a point in 3D space:
 2.  **Noise Injection:** Subtract 3D Noise from the SDF value to create "erosion" and "wisps."
 3.  **Thresholding:** Convert the SDF value into a density value (0.0 to 1.0).
 
+### Blender Shader Findings (CloudCreator_Fancy_Mtl)
+From `blender_shader_dump_full.json`, the actual cloud shader is a **custom shader group**:
+- The material feeds **Volume** from a node group named `CloudCreator_Fancy_Mtl`.
+- The `Principled Volume` node in the material is **not wired**; all logic is inside the group.
+- The group exposes parameters we should mirror as uniforms:
+  - `Density`, `Absorption Color`, `Top`, `Bottom`, `Z Offset`, `Billowy Factor`,
+    `Shadows`, `Zpadding`, `ZBlur`, `Intensity`, `FlipZ`, `Coverage`, `Mix`,
+    `Color Offset`, `Big Scale`, `Mid Scale`, `Small Scale`.
+
+**Inside the group (high-level):**
+- **Three 3D Noise layers** (big/mid/small) blended together:
+  - Big scale ~ `0.1`
+  - Mid scale ~ `4.12`
+  - Small scale ~ `12.0`
+- **Coverage + Billowy shaping**: Map Range remaps noise based on `Coverage` and `Billowy Factor`.
+- **Vertical shaping**: Z-gradient uses `Zpadding`, `ZBlur`, `Z Offset`, and `FlipZ`.
+- **Coloring**: `Top` and `Bottom` colors are mixed, with a `Color Offset` ramp bias.
+- **Dual-volume shading**: two `Principled Volume` nodes are added together
+  (anisotropy around ~0.5 and ~0.9) for lighting/shadow behavior.
+
+These should be reflected in our density function and shading step so WebGPU matches Blender.
+
+### Blender Shader Properties (Exact)
+From `blender_shader_dump_props.json`, we can mirror the exact node settings:
+- **Noise Textures**
+  - All are **3D**.
+  - `Noise Texture` and `Noise Texture.001` have `normalize = True`.
+  - `Noise Texture.002` has `normalize = False`.
+- **Attribute / Volume Info**
+  - Attribute name is `density`.
+- **Map Range**
+  - All Map Range nodes have `clamp = True`, `interpolation = LINEAR`.
+- **Mix nodes**
+  - `Mix.001` = `LINEAR_LIGHT` (RGBA)
+  - `Mix.002` = `OVERLAY` (RGBA)
+  - `Mix.003` = `LINEAR_LIGHT` (RGBA)
+  - `Mix.004` = `LINEAR_LIGHT` (RGBA), `clamp_result = True`
+  - `Mix.007` = `MIX` (RGBA), `clamp_result = True`
+  - Others are standard `MIX` (FLOAT/RGBA).
+- **Math ops**
+  - `MULTIPLY`, `POWER`, `ADD`, `SUBTRACT`, `LESS_THAN` exactly as in the node graph.
+
 ### The Renderer
 1.  **Ray-AABB Intersection:** Calculate where the ray enters and exits our Cube.
 2.  **Raymarching Loop:** Step through the cube, sampling `D(p)`.
@@ -52,12 +94,17 @@ We will define a Density Function `D(p)` where `p` is a point in 3D space:
 - [ ] Integrate fBm noise to erode the SDF edges (Billowy effect).
 - [ ] Add a second layer of high-frequency noise for the "Wispy" effect.
 - [ ] Implement a "Density Gradient" to make the bottom of the cloud flatter/denser.
+- [ ] Match Blender controls: `Coverage`, `Billowy Factor`, and multi-scale noise blend
+      (`Big Scale`, `Mid Scale`, `Small Scale`).
+- [ ] Add a Z-based shaping block: `Zpadding`, `ZBlur`, `Z Offset`, and `FlipZ`.
 
 ### Phase 4: Lighting & Refinement
 - [ ] Implement Beer's Law for light absorption (translucency).
 - [ ] Add a simple "Sun" light source.
 - [ ] Implement "directional scattering" (sampling density towards the light).
 - [ ] Optimize step size and performance.
+- [ ] Add optional "dual-volume" style shading (two anisotropy settings) to mimic
+      the Blender group behavior.
 
 ### Phase 5: Interaction (Optional)
 - [ ] Add UI controls for Cloud Scale, Density, and Noise Intensity.
@@ -66,6 +113,8 @@ We will define a Density Function `D(p)` where `p` is a point in 3D space:
 
 ## 4. Current Task
 - **Next Step:** Implement Phase 1 (3D Noise and fBm) and the Ray-Box intersection.
+- **Immediate Follow-up:** Extract Blender node properties (Math ops, Map Range clamps,
+  Mix blend types, Attribute names) to mirror the exact density function.
 
 ---
 

@@ -250,8 +250,8 @@ struct VolumeUniforms {
   zPadding : f32,
   flipZ : f32,
   absorption : f32,
-  padding0 : f32,
-  padding1 : f32,
+  renderSteps : f32,
+  lightSteps : f32,
 };
 
 @binding(0) @group(0) var<uniform> volumeUniforms : VolumeUniforms;
@@ -410,6 +410,19 @@ fn calcNormal(p : vec3<f32>) -> vec3<f32> {
   return normalize(n);
 }
 
+fn lightMarch(pos : vec3<f32>, lightDir : vec3<f32>, absorption : f32) -> f32 {
+  // March toward the light to estimate how much cloud is in the way
+  let numSteps = i32(volumeUniforms.lightSteps);
+  let stepSize = 0.12;
+  var totalDensity = 0.0;
+  for (var i = 1; i <= numSteps; i++) {
+    let samplePos = pos + lightDir * f32(i) * stepSize;
+    totalDensity += sampleDensity(samplePos);
+  }
+  // Beer's Law: how much light reaches this point
+  return exp(-totalDensity * stepSize * absorption);
+}
+
 @fragment
 fn fs_volume(@location(0) ndc : vec2<f32>) -> @location(0) vec4<f32> {
   // Unproject NDC to world-space ray
@@ -432,8 +445,8 @@ fn fs_volume(@location(0) ndc : vec2<f32>) -> @location(0) vec4<f32> {
   let tFar = t.y;
 
   // Volumetric raymarching with Beer's Law
-  let numSteps = 64;
-  let stepSize = (tFar - tNear) / f32(numSteps);
+  let numSteps = i32(volumeUniforms.renderSteps);
+  let stepSize = (tFar - tNear) / volumeUniforms.renderSteps;
   let absorption = volumeUniforms.absorption;
 
   var transmittance = 1.0;
@@ -452,9 +465,14 @@ fn fs_volume(@location(0) ndc : vec2<f32>) -> @location(0) vec4<f32> {
       // Beer's Law: light attenuates exponentially through dense material
       let attenuation = exp(-density * stepSize * absorption);
 
-      // Simple ambient + directional shading based on density gradient
-      let ambient = 0.4;
-      let shade = ambient + (1.0 - ambient) * cloudColor;
+      // Light marching: how much light reaches this point from the sun
+      let lightTransmittance = lightMarch(pos, lightDir, absorption);
+
+      // Combine ambient + directional light
+      let ambient = 0.3;
+      let directional = lightTransmittance * 0.7;
+      let luminance = ambient + directional;
+      let shade = luminance * cloudColor;
 
       accColor += shade * density * stepSize * absorption * transmittance;
       transmittance *= attenuation;
@@ -711,6 +729,8 @@ async function init() {
     zPadding: 0.0,
     flipZ: false,
     absorption: 5.0,
+    renderSteps: 64,
+    lightSteps: 6,
     blendMode: 'Sharp',
     smoothness: 0.3,
   };
@@ -769,6 +789,8 @@ async function init() {
 
   const lightingFolder = gui.addFolder('Lighting');
   lightingFolder.add(params, 'absorption', 1.0, 20.0, 0.5).name('Absorption');
+  lightingFolder.add(params, 'renderSteps', 16, 128, 1).name('Render Steps');
+  lightingFolder.add(params, 'lightSteps', 1, 16, 1).name('Light Steps');
 
   gui.add(params, 'blendMode', ['Sharp', 'Smooth']).name('Blend Mode');
   gui.add(params, 'smoothness', 0.05, 1.0, 0.01).name('Smoothness');
@@ -847,7 +869,7 @@ async function init() {
     // wispyScale, wispyStrength, coverage, zPadding, flipZ, padding...
     device.queue.writeBuffer(volumeUniformBuffer, 128, new Float32Array([
       params.wispyScale, params.wispyStrength, params.coverage, params.zPadding,
-      params.flipZ ? 1.0 : 0.0, params.absorption, 0.0, 0.0,
+      params.flipZ ? 1.0 : 0.0, params.absorption, params.renderSteps, params.lightSteps,
     ]));
 
     const commandEncoder = device.createCommandEncoder();

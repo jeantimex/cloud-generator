@@ -813,10 +813,10 @@ async function init() {
     gradientBottom: -0.2,
     gradientTop: 0.5,
     gradientStrength: 0.0,
-    billowyScale: 1.5,
-    billowyStrength: 0.0,
-    wispyScale: 8.0,
-    wispyStrength: 0.0,
+    billowyScale: 3.0,
+    billowyStrength: 0.2,
+    wispyScale: 9.5,
+    wispyStrength: 0.12,
     coverage: 0.0,
     zPadding: 0.0,
     flipZ: false,
@@ -919,7 +919,7 @@ async function init() {
   // Orbit camera state
   let orbitTheta = Math.PI / 4;   // horizontal angle
   let orbitPhi = Math.PI / 4;     // vertical angle (from top)
-  let orbitDistance = 6;
+  let orbitDistance = 4;
   let isDragging = false;
   let lastMouseX = 0;
   let lastMouseY = 0;
@@ -963,7 +963,7 @@ async function init() {
 
     // Update Cube Uniforms
     device.queue.writeBuffer(cubeUniforms.buffer, 0, modelViewProjectionMatrix);
-    device.queue.writeBuffer(cubeUniforms.buffer, 64, new Float32Array([0.0, 1.0, 0.0, 1.0]));
+    device.queue.writeBuffer(cubeUniforms.buffer, 64, new Float32Array([1.0, 0.5, 0.2, 1.0]));
 
     // Update Grid Uniforms
     device.queue.writeBuffer(gridUniforms.buffer, 0, modelViewProjectionMatrix);

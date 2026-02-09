@@ -233,6 +233,7 @@ fn fs_main() -> @location(0) vec4<f32> {
 
 const volumeShaderCode = `
 struct VolumeUniforms {
+  viewProjection : mat4x4<f32>,
   inverseViewProjection : mat4x4<f32>,
   cameraPosition : vec3<f32>,
   sphereCount : u32,
@@ -267,23 +268,14 @@ struct VolumeUniforms {
 
 struct VertexOutput {
   @builtin(position) Position : vec4<f32>,
-  @location(0) ndc : vec2<f32>,
+  @location(0) worldPos : vec3<f32>,
 };
 
 @vertex
-fn vs_volume(@builtin(vertex_index) vertexIndex : u32) -> VertexOutput {
-  // Full-screen quad from 6 vertices (2 triangles)
-  var pos = array<vec2<f32>, 6>(
-    vec2(-1.0, -1.0),
-    vec2( 1.0, -1.0),
-    vec2(-1.0,  1.0),
-    vec2(-1.0,  1.0),
-    vec2( 1.0, -1.0),
-    vec2( 1.0,  1.0),
-  );
+fn vs_volume(@location(0) position: vec4<f32>) -> VertexOutput {
   var output : VertexOutput;
-  output.Position = vec4(pos[vertexIndex], 0.0, 1.0);
-  output.ndc = pos[vertexIndex];
+  output.Position = volumeUniforms.viewProjection * position;
+  output.worldPos = position.xyz;
   return output;
 }
 
@@ -444,17 +436,11 @@ fn lightMarch(pos : vec3<f32>, lightDir : vec3<f32>, absorption : f32) -> f32 {
 }
 
 @fragment
-fn fs_volume(@location(0) ndc : vec2<f32>) -> @location(0) vec4<f32> {
-  // Unproject NDC to world-space ray
-  let nearPoint = volumeUniforms.inverseViewProjection * vec4(ndc, -1.0, 1.0);
-  let farPoint = volumeUniforms.inverseViewProjection * vec4(ndc, 1.0, 1.0);
-  let nearWorld = nearPoint.xyz / nearPoint.w;
-  let farWorld = farPoint.xyz / farPoint.w;
-
+fn fs_volume(@location(0) worldPos : vec3<f32>) -> @location(0) vec4<f32> {
   let rayOrigin = volumeUniforms.cameraPosition;
-  let rayDir = normalize(farWorld - nearWorld);
+  let rayDir = normalize(worldPos - rayOrigin);
 
-  // Intersect with dynamic bounding box
+  // Intersect with dynamic bounding box to find entry/exit points
   let t = intersectAABB(rayOrigin, rayDir, volumeUniforms.boxMin, volumeUniforms.boxMax);
 
   if (t.x > t.y || t.y < 0.0) {
@@ -588,6 +574,21 @@ async function init() {
   });
   device.queue.writeBuffer(indexBuffer, 0, indices);
 
+  // Solid cube indices for volume rendering
+  const solidIndices = new Uint16Array([
+    0, 1, 2, 0, 2, 3, // Front
+    4, 7, 6, 4, 6, 5, // Back
+    0, 4, 5, 0, 5, 1, // Bottom
+    3, 2, 6, 3, 6, 7, // Top
+    0, 3, 7, 0, 7, 4, // Left
+    1, 5, 6, 1, 6, 2  // Right
+  ]);
+  const solidIndexBuffer = device.createBuffer({
+    size: solidIndices.byteLength,
+    usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(solidIndexBuffer, 0, solidIndices);
+
   // Grid floor
   const gridLines = 20;
   const gridSize = 10;
@@ -655,6 +656,11 @@ async function init() {
     primitive: {
       topology: 'line-list',
     },
+    depthStencil: {
+      depthWriteEnabled: true,
+      depthCompare: 'less',
+      format: 'depth24plus',
+    },
   });
 
   const createUniformBindGroup = () => {
@@ -682,7 +688,18 @@ async function init() {
     vertex: {
       module: volumeShaderModule,
       entryPoint: 'vs_volume',
-      buffers: [],
+      buffers: [
+        {
+          arrayStride: 16,
+          attributes: [
+            {
+              shaderLocation: 0,
+              offset: 0,
+              format: 'float32x4',
+            },
+          ],
+        },
+      ],
     },
     fragment: {
       module: volumeShaderModule,
@@ -692,7 +709,7 @@ async function init() {
           format: canvasFormat,
           blend: {
             color: {
-              srcFactor: 'src-alpha',
+              srcFactor: 'one',
               dstFactor: 'one-minus-src-alpha',
               operation: 'add',
             },
@@ -708,12 +725,18 @@ async function init() {
     },
     primitive: {
       topology: 'triangle-list',
+      cullMode: 'front',
+    },
+    depthStencil: {
+      depthWriteEnabled: false,
+      depthCompare: 'less',
+      format: 'depth24plus',
     },
   });
 
-  // Volume uniform buffer: 208 bytes (see VolumeUniforms struct)
+  // Volume uniform buffer: 272 bytes (see VolumeUniforms struct)
   const volumeUniformBuffer = device.createBuffer({
-    size: 208,
+    size: 272,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
@@ -759,6 +782,15 @@ async function init() {
       ],
     });
   }
+
+  canvas.width = window.innerWidth * window.devicePixelRatio;
+  canvas.height = window.innerHeight * window.devicePixelRatio;
+
+  let depthTexture = device.createTexture({
+    size: [canvas.width, canvas.height],
+    format: 'depth24plus',
+    usage: GPUTextureUsage.RENDER_ATTACHMENT,
+  });
 
   const viewProjectionMatrix = mat4.create();
   const inverseViewProjectionMatrix = mat4.create();
@@ -940,27 +972,28 @@ async function init() {
     // Update Volume Uniforms
     mat4.multiply(viewProjectionMatrix, projectionMatrix, viewMatrix);
     mat4.invert(inverseViewProjectionMatrix, viewProjectionMatrix);
-    device.queue.writeBuffer(volumeUniformBuffer, 0, inverseViewProjectionMatrix);
-    device.queue.writeBuffer(volumeUniformBuffer, 64, new Float32Array([cameraPos[0], cameraPos[1], cameraPos[2]]));
-    device.queue.writeBuffer(volumeUniformBuffer, 76, new Uint32Array([sphereCount]));
+    device.queue.writeBuffer(volumeUniformBuffer, 0, viewProjectionMatrix);
+    device.queue.writeBuffer(volumeUniformBuffer, 64, inverseViewProjectionMatrix);
+    device.queue.writeBuffer(volumeUniformBuffer, 128, new Float32Array([cameraPos[0], cameraPos[1], cameraPos[2]]));
+    device.queue.writeBuffer(volumeUniformBuffer, 140, new Uint32Array([sphereCount]));
     const smoothnessValue = params.blendMode === 'Smooth' ? params.smoothness : 0.0;
-    device.queue.writeBuffer(volumeUniformBuffer, 80, new Float32Array([
+    device.queue.writeBuffer(volumeUniformBuffer, 144, new Float32Array([
       smoothnessValue, params.gradientBottom, params.gradientTop, params.gradientStrength,
     ]));
     // boxMin (vec3) + billowyScale (f32)
-    device.queue.writeBuffer(volumeUniformBuffer, 96, new Float32Array([
+    device.queue.writeBuffer(volumeUniformBuffer, 160, new Float32Array([
       ...cloudBounds.min, params.billowyScale,
     ]));
     // boxMax (vec3) + billowyStrength (f32)
-    device.queue.writeBuffer(volumeUniformBuffer, 112, new Float32Array([
+    device.queue.writeBuffer(volumeUniformBuffer, 176, new Float32Array([
       ...cloudBounds.max, params.billowyStrength,
     ]));
-    // wispyScale, wispyStrength, coverage, zPadding, flipZ, padding...
-    device.queue.writeBuffer(volumeUniformBuffer, 128, new Float32Array([
+    // wispyScale, wispyStrength, coverage, zPadding, flipZ, absorption, renderSteps, lightSteps
+    device.queue.writeBuffer(volumeUniformBuffer, 192, new Float32Array([
       params.wispyScale, params.wispyStrength, params.coverage, params.zPadding,
       params.flipZ ? 1.0 : 0.0, params.absorption, params.renderSteps, params.lightSteps,
     ]));
-    device.queue.writeBuffer(volumeUniformBuffer, 160, new Float32Array([
+    device.queue.writeBuffer(volumeUniformBuffer, 224, new Float32Array([
       params.renderMode === 'Volume' ? 1.0 : 0.0, params.anisotropy1, params.anisotropy2, params.phaseBlend,
     ]));
     // Parse cloud color hex to RGB floats
@@ -968,7 +1001,7 @@ async function init() {
     const cr = ((cc >> 16) & 0xff) / 255;
     const cg = ((cc >> 8) & 0xff) / 255;
     const cb = (cc & 0xff) / 255;
-    device.queue.writeBuffer(volumeUniformBuffer, 176, new Float32Array([
+    device.queue.writeBuffer(volumeUniformBuffer, 240, new Float32Array([
       params.sunX, params.sunY, params.sunZ, params.ambient,
       cr, cg, cb, 0.0,
     ]));
@@ -980,11 +1013,17 @@ async function init() {
       colorAttachments: [
         {
           view: textureView,
-          clearValue: { r: 0.1, g: 0.1, b: 0.1, a: 1.0 },
+          clearValue: { r: 64 / 255, g: 62 / 255, b: 63 / 255, a: 1.0 },
           loadOp: 'clear',
           storeOp: 'store',
         },
       ],
+      depthStencilAttachment: {
+        view: depthTexture.createView(),
+        depthClearValue: 1.0,
+        depthLoadOp: 'clear',
+        depthStoreOp: 'store',
+      },
     };
 
     const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
@@ -996,16 +1035,18 @@ async function init() {
     passEncoder.setBindGroup(0, gridUniforms.bindGroup);
     passEncoder.drawIndexed(gridIndices.length);
 
-    // Draw Cube
+    // Draw Cube (wireframe)
     passEncoder.setVertexBuffer(0, vertexBuffer);
     passEncoder.setIndexBuffer(indexBuffer, 'uint16');
     passEncoder.setBindGroup(0, cubeUniforms.bindGroup);
     passEncoder.drawIndexed(indices.length);
 
-    // Draw Volume (raymarched fog)
+    // Draw Volume (raymarched fog inside the cube)
     passEncoder.setPipeline(volumePipeline);
+    passEncoder.setVertexBuffer(0, vertexBuffer);
+    passEncoder.setIndexBuffer(solidIndexBuffer, 'uint16');
     passEncoder.setBindGroup(0, volumeBindGroup);
-    passEncoder.draw(6);
+    passEncoder.drawIndexed(solidIndices.length);
 
     passEncoder.end();
 
@@ -1019,9 +1060,13 @@ async function init() {
   window.addEventListener('resize', () => {
     canvas.width = window.innerWidth * window.devicePixelRatio;
     canvas.height = window.innerHeight * window.devicePixelRatio;
+    depthTexture.destroy();
+    depthTexture = device.createTexture({
+      size: [canvas.width, canvas.height],
+      format: 'depth24plus',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    });
   });
-  canvas.width = window.innerWidth * window.devicePixelRatio;
-  canvas.height = window.innerHeight * window.devicePixelRatio;
 }
 
 init();

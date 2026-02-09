@@ -275,8 +275,8 @@ From `blender_shader_dump_props.json`, we can mirror the exact node settings:
 > **Phase 4 Expected Outcome:** The cloud gains realistic lighting — bright on the sun-facing side, shadowed on the opposite side, with light scattering through thin areas (silver lining effect). Self-shadowing creates depth and dimension. The dual-volume shading produces both soft diffuse scattering and bright forward-scattering halos. Performance is optimized for interactive frame rates. The cloud looks volumetric and three-dimensional — not flat.
 
 ### Phase 5: Interaction (Optional)
-- [ ] Add UI controls for Cloud Scale, Density, and Noise Intensity.
-  > *Outcome:* An on-screen control panel with sliders for: cloud scale (overall size), density (opacity/thickness), noise intensity (detail level), coverage, billowy factor, and light direction. Each slider writes to its corresponding GPU uniform. Changes are reflected in the next frame — real-time interactive feedback with no reload required.
+- [x] Add UI controls for Cloud Scale, Density, and Noise Intensity.
+  > *Outcome:* "Appearance" folder with Cloud Color (color picker), Ambient (0–1 slider), and Cloud Scale (0.2–3.0, triggers regeneration). Cloud color and ambient are GPU uniforms updated each frame. Cloud scale multiplies all sphere positions and radii on the CPU before upload. All previously added controls (absorption, coverage, billowy/wispy, sun direction, anisotropy, etc.) complete the full interactive panel.
 
 > **Phase 5 Expected Outcome:** Artists can experiment with cloud shapes interactively. Dragging sliders immediately updates the cloud's appearance in the viewport — adjusting size, density, noise detail, and lighting without editing code.
 
@@ -292,7 +292,8 @@ From `blender_shader_dump_props.json`, we can mirror the exact node settings:
 - [x] ~~Phase 3 (Noise & Detail) — 3D noise, fBm, billowy + wispy noise, coverage, Z-shaping.~~
 - [x] ~~Phase 4 (Lighting) — Beer's Law, sun light, light marching, adaptive stepping, render mode toggle.~~
 - [x] ~~Phase 4 remaining — dual-volume shading (Henyey-Greenstein silver lining).~~
-- **Next Step:** Phase 5 (Interaction) — additional UI controls.
+- [x] ~~Phase 5 (Interaction) — Cloud Scale, Cloud Color, Ambient controls.~~
+- All phases complete!
 
 ---
 

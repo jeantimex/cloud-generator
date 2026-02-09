@@ -257,6 +257,8 @@ struct VolumeUniforms {
   anisotropy2 : f32,
   phaseBlend : f32,
   lightDir : vec3<f32>,
+  ambient : f32,
+  cloudColor : vec3<f32>,
   _pad : f32,
 };
 
@@ -485,9 +487,9 @@ fn fs_volume(@location(0) ndc : vec2<f32>) -> @location(0) vec4<f32> {
     let hitPos = rayOrigin + rayDir * tCurrent;
     let normal = calcNormal(hitPos);
     let diffuse = max(dot(normal, lightDir), 0.0);
-    let ambient = 0.3;
-    let shade = ambient + diffuse * 0.7;
-    return vec4(vec3(shade), 1.0);
+    let ambient = volumeUniforms.ambient;
+    let shade = ambient + diffuse * (1.0 - ambient);
+    return vec4(volumeUniforms.cloudColor * shade, 1.0);
   }
 
   // Volume mode: adaptive raymarching with Beer's Law
@@ -497,7 +499,7 @@ fn fs_volume(@location(0) ndc : vec2<f32>) -> @location(0) vec4<f32> {
 
   var transmittance = 1.0;
   var accColor = vec3(0.0);
-  let cloudColor = vec3(1.0, 1.0, 1.0);
+  let cloudColor = volumeUniforms.cloudColor;
 
   var tCurrent = tNear;
   for (var i = 0; i < maxSteps; i++) {
@@ -522,8 +524,8 @@ fn fs_volume(@location(0) ndc : vec2<f32>) -> @location(0) vec4<f32> {
       let cosTheta = dot(rayDir, lightDir);
       let phase = dualPhase(cosTheta) * 4.0 * 3.14159265;
 
-      // Base lighting (same as pre-phase): always present
-      let ambient = 0.3;
+      // Base lighting: always present
+      let ambient = volumeUniforms.ambient;
       let directional = lightTransmittance * 0.7;
       // Silver lining boost: phase > 1 adds extra brightness (forward scattering)
       let phaseBoost = lightTransmittance * max(phase - 1.0, 0.0) * 0.7;
@@ -709,9 +711,9 @@ async function init() {
     },
   });
 
-  // Volume uniform buffer: 192 bytes (see VolumeUniforms struct)
+  // Volume uniform buffer: 208 bytes (see VolumeUniforms struct)
   const volumeUniformBuffer = device.createBuffer({
-    size: 192,
+    size: 208,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
@@ -796,6 +798,9 @@ async function init() {
     sunX: 1.0,
     sunY: 1.0,
     sunZ: 0.5,
+    ambient: 0.3,
+    cloudColor: '#ffffff',
+    cloudScale: 1.0,
     blendMode: 'Sharp',
     smoothness: 0.3,
   };
@@ -820,6 +825,13 @@ async function init() {
       data = generateWispy(repOpts);
     } else {
       data = generateEllipsoid(repOpts);
+    }
+    // Apply cloud scale
+    const s = params.cloudScale;
+    if (s !== 1.0) {
+      for (let i = 0; i < data.length; i++) {
+        data[i] *= s;
+      }
     }
     rebuildSpheres(data);
     console.log(`[${params.shape}] Generated ${sphereCount} spheres`);
@@ -863,6 +875,11 @@ async function init() {
   lightingFolder.add(params, 'anisotropy1', -0.99, 0.99, 0.01).name('Anisotropy 1');
   lightingFolder.add(params, 'anisotropy2', -0.99, 0.99, 0.01).name('Anisotropy 2');
   lightingFolder.add(params, 'phaseBlend', 0.0, 1.0, 0.01).name('Phase Blend');
+
+  const appearanceFolder = gui.addFolder('Appearance');
+  appearanceFolder.addColor(params, 'cloudColor').name('Cloud Color');
+  appearanceFolder.add(params, 'ambient', 0.0, 1.0, 0.01).name('Ambient');
+  appearanceFolder.add(params, 'cloudScale', 0.2, 3.0, 0.05).name('Cloud Scale').onChange(regenerate);
 
   gui.add(params, 'blendMode', ['Sharp', 'Smooth']).name('Blend Mode');
   gui.add(params, 'smoothness', 0.05, 1.0, 0.01).name('Smoothness');
@@ -946,8 +963,14 @@ async function init() {
     device.queue.writeBuffer(volumeUniformBuffer, 160, new Float32Array([
       params.renderMode === 'Volume' ? 1.0 : 0.0, params.anisotropy1, params.anisotropy2, params.phaseBlend,
     ]));
+    // Parse cloud color hex to RGB floats
+    const cc = parseInt(params.cloudColor.slice(1), 16);
+    const cr = ((cc >> 16) & 0xff) / 255;
+    const cg = ((cc >> 8) & 0xff) / 255;
+    const cb = (cc & 0xff) / 255;
     device.queue.writeBuffer(volumeUniformBuffer, 176, new Float32Array([
-      params.sunX, params.sunY, params.sunZ, 0.0,
+      params.sunX, params.sunY, params.sunZ, params.ambient,
+      cr, cg, cb, 0.0,
     ]));
 
     const commandEncoder = device.createCommandEncoder();

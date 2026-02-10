@@ -56,6 +56,179 @@ function replicateSpheres(baseSpheres, rng, options = {}) {
   return new Float32Array(spheres);
 }
 
+function rayIntersectsTriangle(origin, dir, v0, v1, v2) {
+  const e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+  const e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+  const h = [
+    dir[1] * e2[2] - dir[2] * e2[1],
+    dir[2] * e2[0] - dir[0] * e2[2],
+    dir[0] * e2[1] - dir[1] * e2[0]
+  ];
+  const a = e1[0] * h[0] + e1[1] * h[1] + e1[2] * h[2];
+  if (a > -0.00001 && a < 0.00001) return null;
+  const f = 1.0 / a;
+  const s = [origin[0] - v0[0], origin[1] - v0[1], origin[2] - v0[2]];
+  const u = f * (s[0] * h[0] + s[1] * h[1] + s[2] * h[2]);
+  if (u < 0.0 || u > 1.0) return null;
+  const q = [
+    s[1] * e1[2] - s[2] * e1[1],
+    s[2] * e1[0] - s[0] * e1[2],
+    s[0] * e1[1] - s[1] * e1[0]
+  ];
+  const v = f * (dir[0] * q[0] + dir[1] * q[1] + dir[2] * q[2]);
+  if (v < 0.0 || u + v > 1.0) return null;
+  const t = f * (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]);
+  return t > 0.00001 ? t : null;
+}
+
+function voxelizeMesh(vertices, indices, options = {}) {
+  const { resolution = 15, seed = 42 } = options;
+  const rng = createRNG(seed);
+  
+  // 1. Compute bounding box
+  let min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < vertices.length; i += 3) {
+    for (let j = 0; j < 3; j++) {
+      min[j] = Math.min(min[j], vertices[i + j]);
+      max[j] = Math.max(max[j], vertices[i + j]);
+    }
+  }
+
+  const size = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+  const maxDim = Math.max(...size);
+  const step = maxDim / resolution;
+  const spheres = [];
+
+  // 2. Scan grid
+  for (let x = min[0] + step / 2; x <= max[0]; x += step) {
+    for (let y = min[1] + step / 2; y <= max[1]; y += step) {
+      for (let z = min[2] + step / 2; z <= max[2]; z += step) {
+        // Point-in-mesh test using raycasting
+        let intersections = 0;
+        const origin = [x, y, z];
+        const dir = [1, 0.432, 0.123]; // Random-ish direction to avoid edge cases
+        
+        for (let i = 0; i < indices.length; i += 3) {
+          const v0 = [vertices[indices[i] * 3], vertices[indices[i] * 3 + 1], vertices[indices[i] * 3 + 2]];
+          const v1 = [vertices[indices[i + 1] * 3], vertices[indices[i + 1] * 3 + 1], vertices[indices[i + 1] * 3 + 2]];
+          const v2 = [vertices[indices[i + 2] * 3], vertices[indices[i + 2] * 3 + 1], vertices[indices[i + 2] * 3 + 2]];
+          if (rayIntersectsTriangle(origin, dir, v0, v1, v2) !== null) {
+            intersections++;
+          }
+        }
+
+        if (intersections % 2 === 1) {
+          // Randomize position slightly and randomize radius
+          const radVar = options.radiusVariation || 0.4;
+          const radiusJitter = (1.0 - radVar / 2) + rng() * radVar; 
+          spheres.push(
+            x + (rng() - 0.5) * step * 0.3, 
+            y + (rng() - 0.5) * step * 0.3, 
+            z + (rng() - 0.5) * step * 0.3, 
+            step * 0.75 * radiusJitter
+          );
+        }
+      }
+    }
+  }
+
+  return replicateSpheres(spheres, rng, options);
+}
+
+function parseOBJ(text) {
+  const vertices = [];
+  const indices = [];
+  const lines = text.split('\n');
+  for (let line of lines) {
+    const parts = line.trim().split(/\s+/);
+    if (parts[0] === 'v') {
+      vertices.push(parseFloat(parts[1]), parseFloat(parts[2]), parseFloat(parts[3]));
+    } else if (parts[0] === 'f') {
+      // Handle f v1/vt1/vn1 v2/vt2/vn2 v3/vt3/vn3
+      const v1 = parseInt(parts[1].split('/')[0]) - 1;
+      const v2 = parseInt(parts[2].split('/')[0]) - 1;
+      const v3 = parseInt(parts[3].split('/')[0]) - 1;
+      indices.push(v1, v2, v3);
+    }
+  }
+  return { vertices: new Float32Array(vertices), indices: new Uint32Array(indices) };
+}
+
+function catmullRom(p0, p1, p2, p3, t) {
+  const v0 = (p2 - p0) * 0.5;
+  const v1 = (p3 - p1) * 0.5;
+  const t2 = t * t;
+  const t3 = t2 * t;
+  return (2 * p1 - 2 * p2 + v0 + v1) * t3 + (-3 * p1 + 3 * p2 - 2 * v0 - v1) * t2 + v0 * t + p1;
+}
+
+function generateFromCurve(options = {}) {
+  const {
+    curveType = 'S-Curve',
+    numPoints = 20,
+    thickness = 0.2,
+    backboneNoise = 0.1,
+    seed = 42,
+    radiusVariation = 0.5,
+  } = options;
+  const rng = createRNG(seed);
+  const spheres = [];
+
+  let controlPoints = [];
+  if (curveType === 'S-Curve') {
+    controlPoints = [
+      [-0.8, 0, 0], [-0.4, 0.2, 0.3], [0, -0.1, -0.2], [0.4, 0.3, 0.4], [0.8, 0, 0]
+    ];
+  } else if (curveType === 'Spiral') {
+    const turns = 2.5;
+    const points = 12;
+    for (let i = 0; i < points; i++) {
+      const t = i / (points - 1);
+      const angle = t * Math.PI * 2 * turns;
+      const radius = t * 0.8;
+      controlPoints.push([Math.cos(angle) * radius, (rng() - 0.5) * 0.1, Math.sin(angle) * radius]);
+    }
+  } else if (curveType === 'Circle') {
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * Math.PI * 2;
+      controlPoints.push([Math.cos(a) * 0.7, 0, Math.sin(a) * 0.7]);
+    }
+    controlPoints.push(controlPoints[0], controlPoints[1], controlPoints[2]); // Close the loop
+  }
+
+  const getPoint = (t) => {
+    const n = controlPoints.length - 1;
+    const i = Math.floor(t * n);
+    const frac = (t * n) - i;
+    const p1 = controlPoints[Math.min(i, n)];
+    const p2 = controlPoints[Math.min(i + 1, n)];
+    const p0 = controlPoints[Math.max(i - 1, 0)];
+    const p3 = controlPoints[Math.min(i + 2, n)];
+    return [
+      catmullRom(p0[0], p1[0], p2[0], p3[0], frac),
+      catmullRom(p0[1], p1[1], p2[1], p3[1], frac),
+      catmullRom(p0[2], p1[2], p2[2], p3[2], frac)
+    ];
+  };
+
+  for (let i = 0; i < numPoints; i++) {
+    const t = i / (numPoints - 1);
+    const basePos = getPoint(t);
+    
+    // Apply backbone noise
+    const x = basePos[0] + (rng() - 0.5) * backboneNoise;
+    const y = basePos[1] + (rng() - 0.5) * backboneNoise;
+    const z = basePos[2] + (rng() - 0.5) * backboneNoise;
+
+    // Radius ramp: thinner at ends
+    const profile = Math.sin(t * Math.PI);
+    const radius = thickness * (0.6 + 0.4 * profile) * (1.0 + (rng() - 0.5) * radiusVariation);
+    spheres.push(x, y, z, radius);
+  }
+
+  return replicateSpheres(spheres, rng, options);
+}
+
 function generateCumulus(options = {}) {
   const {
     gridX = 4,
@@ -83,7 +256,8 @@ function generateCumulus(options = {}) {
 
       if (y < flattenBottom) y = flattenBottom;
 
-      const radius = pointSeparation * (0.90 + rng() * 0.52);
+      const radVar = options.radiusVariation || 0.5;
+      const radius = pointSeparation * (1.1 + (rng() - 0.5) * radVar);
       spheres.push(x, y, z, radius);
     }
   }
@@ -854,6 +1028,13 @@ async function init() {
     smoothness: 0.3,
     timeScale: 0.2,
     warpStrength: 0.15,
+    meshResolution: 15,
+    customMesh: null,
+    radiusVariation: 0.5,
+    curveType: 'S-Curve',
+    curvePoints: 20,
+    curveThickness: 0.2,
+    curveBackboneNoise: 0.1,
   };
 
   function regenerate() {
@@ -864,6 +1045,7 @@ async function init() {
       keepProbability: params.keepProb,
       scaleMult: params.scaleMult,
       seed: params.seed,
+      radiusVariation: params.radiusVariation,
     };
     if (params.shape === 'Cumulus') {
       data = generateCumulus({
@@ -873,9 +1055,23 @@ async function init() {
         ...repOpts,
       });
     } else if (params.shape === 'Wispy') {
-      data = generateWispy(repOpts);
-    } else {
+      data = generateFromCurve({
+        curveType: params.curveType,
+        numPoints: params.curvePoints,
+        thickness: params.curveThickness,
+        backboneNoise: params.curveBackboneNoise,
+        ...repOpts,
+      });
+    } else if (params.shape === 'Ellipsoid') {
       data = generateEllipsoid(repOpts);
+    } else if (params.shape === 'Custom Mesh' && params.customMesh) {
+      data = voxelizeMesh(params.customMesh.vertices, params.customMesh.indices, {
+        resolution: params.meshResolution,
+        ...repOpts,
+      });
+    } else {
+      // Default to cumulus if nothing else
+      data = generateCumulus(repOpts);
     }
     // Apply cloud scale
     const s = params.cloudScale;
@@ -889,17 +1085,49 @@ async function init() {
   }
 
   const gui = new GUI();
-  gui.add(params, 'shape', ['Cumulus', 'Wispy', 'Ellipsoid']).name('Shape').onChange(regenerate);
+  gui.add(params, 'shape', ['Cumulus', 'Wispy', 'Ellipsoid', 'Custom Mesh']).name('Shape').onChange(regenerate);
+
+  const meshFolder = gui.addFolder('Mesh Settings');
+  meshFolder.add(params, 'meshResolution', 5, 30, 1).name('Voxel Res');
+  const meshFileObj = {
+    loadMesh: () => {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = '.obj';
+      input.onchange = (e) => {
+        const file = e.target.files[0];
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          params.customMesh = parseOBJ(event.target.result);
+          params.shape = 'Custom Mesh';
+          gui.controllers.find(c => c._name === 'Shape').updateDisplay();
+          regenerate();
+        };
+        reader.readAsText(file);
+      };
+      input.click();
+    }
+  };
+  meshFolder.add(meshFileObj, 'loadMesh').name('Upload OBJ (.obj)');
 
   const shapeFolder = gui.addFolder('Shape Settings');
+  shapeFolder.add(params, 'radiusVariation', 0.0, 1.0, 0.05).name('Radius Var').onChange(regenerate);
   shapeFolder.add(params, 'gridX', 1, 12, 1).name('Grid X').onChange(regenerate);
   shapeFolder.add(params, 'gridZ', 1, 12, 1).name('Grid Z').onChange(regenerate);
   shapeFolder.add(params, 'pointSeparation', 0.1, 0.5, 0.01).name('Separation').onChange(regenerate);
-  shapeFolder.add(params, 'iterations', 0, 4, 1).name('Iterations').onChange(regenerate);
-  shapeFolder.add(params, 'children', 1, 8, 1).name('Children').onChange(regenerate);
-  shapeFolder.add(params, 'keepProb', 0.1, 1.0, 0.05).name('Keep Prob').onChange(regenerate);
-  shapeFolder.add(params, 'scaleMult', 0.2, 0.9, 0.05).name('Scale Mult').onChange(regenerate);
-  shapeFolder.add(params, 'seed', 1, 100, 1).name('Seed').onChange(regenerate);
+
+  const curveFolder = gui.addFolder('Curve Settings');
+  curveFolder.add(params, 'curveType', ['S-Curve', 'Spiral', 'Circle']).name('Curve Type').onChange(regenerate);
+  curveFolder.add(params, 'curvePoints', 5, 100, 1).name('Segments').onChange(regenerate);
+  curveFolder.add(params, 'curveThickness', 0.05, 0.5, 0.01).name('Thickness').onChange(regenerate);
+  curveFolder.add(params, 'curveBackboneNoise', 0.0, 0.5, 0.01).name('Backbone Noise').onChange(regenerate);
+
+  const replicationFolder = gui.addFolder('Replication');
+  replicationFolder.add(params, 'iterations', 0, 4, 1).name('Iterations').onChange(regenerate);
+  replicationFolder.add(params, 'children', 1, 8, 1).name('Children').onChange(regenerate);
+  replicationFolder.add(params, 'keepProb', 0.1, 1.0, 0.05).name('Keep Prob').onChange(regenerate);
+  replicationFolder.add(params, 'scaleMult', 0.2, 0.9, 0.05).name('Scale Mult').onChange(regenerate);
+  replicationFolder.add(params, 'seed', 1, 100, 1).name('Seed').onChange(regenerate);
 
   const gradientFolder = gui.addFolder('Density Gradient');
   gradientFolder.add(params, 'gradientBottom', -1.0, 1.0, 0.05).name('Bottom');

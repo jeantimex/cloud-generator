@@ -231,11 +231,15 @@ function generateFromCurve(options = {}) {
 
 function generateCumulus(options = {}) {
   const {
+    species = 'Mediocris',
     gridX = 4,
+    gridY = 4,
     gridZ = 4,
     pointSeparation = 0.25,
     flattenBottom = -0.3,
+    windShear = 0.0,
     seed = 42,
+    radiusVariation = 0.5,
     replicationIterations = 2,
     childrenPerSphere = 4,
     keepProbability = 0.5,
@@ -245,25 +249,41 @@ function generateCumulus(options = {}) {
   const rng = createRNG(seed);
   const spheres = [];
 
-  const halfX = (gridX - 1) * pointSeparation / 2;
-  const halfZ = (gridZ - 1) * pointSeparation / 2;
+  // Species-specific grid adjustments
+  let sx = gridX, sy = gridY, sz = gridZ;
+  if (species === 'Humilis') { sy = Math.max(1, Math.floor(sy * 0.5)); }
+  if (species === 'Congestus') { sy = Math.ceil(sy * 2.0); sx = Math.max(1, Math.floor(sx * 0.7)); sz = Math.max(1, Math.floor(sz * 0.7)); }
+  if (species === 'Fractus') { sy = Math.max(1, Math.floor(sy * 0.6)); }
 
-  for (let ix = 0; ix < gridX; ix++) {
-    for (let iz = 0; iz < gridZ; iz++) {
-      let x = ix * pointSeparation - halfX + (rng() * 2 - 1) * pointSeparation;
-      let y = (rng() * 2 - 1) * pointSeparation;
-      let z = iz * pointSeparation - halfZ + (rng() * 2 - 1) * pointSeparation;
+  const halfX = (sx - 1) * pointSeparation / 2;
+  const halfY = (sy - 1) * pointSeparation / 2;
+  const halfZ = (sz - 1) * pointSeparation / 2;
 
-      if (y < flattenBottom) y = flattenBottom;
+  for (let ix = 0; ix < sx; ix++) {
+    for (let iy = 0; iy < sy; iy++) {
+      for (let iz = 0; iz < sz; iz++) {
+        // Fractus has high chance of missing points
+        if (species === 'Fractus' && rng() > 0.4) continue;
 
-      const radVar = options.radiusVariation || 0.5;
-      const radius = pointSeparation * (1.1 + (rng() - 0.5) * radVar);
-      spheres.push(x, y, z, radius);
+        let x = ix * pointSeparation - halfX + (rng() * 2 - 1) * pointSeparation * 0.8;
+        let y = iy * pointSeparation - halfY + (rng() * 2 - 1) * pointSeparation * 0.8;
+        let z = iz * pointSeparation - halfZ + (rng() * 2 - 1) * pointSeparation * 0.8;
+
+        // Wind Shear: Lean the cloud based on height
+        const heightFactor = (y + halfY) / (sy * pointSeparation);
+        x += heightFactor * windShear;
+
+        if (y < flattenBottom) y = flattenBottom;
+
+        const radVar = radiusVariation || 0.5;
+        const radius = pointSeparation * (1.1 + (rng() - 0.5) * radVar);
+        spheres.push(x, y, z, radius);
+      }
     }
   }
 
   return replicateSpheres(spheres, rng, {
-    replicationIterations, childrenPerSphere, keepProbability, scaleMult,
+    replicationIterations, childrenPerSphere, keepProbability, scaleMult, radiusVariation
   });
 }
 
@@ -1035,6 +1055,9 @@ async function init() {
     curvePoints: 20,
     curveThickness: 0.2,
     curveBackboneNoise: 0.1,
+    species: 'Mediocris',
+    gridY: 4,
+    windShear: 0.0,
   };
 
   function regenerate() {
@@ -1049,9 +1072,12 @@ async function init() {
     };
     if (params.shape === 'Cumulus') {
       data = generateCumulus({
+        species: params.species,
         gridX: params.gridX,
+        gridY: params.gridY,
         gridZ: params.gridZ,
         pointSeparation: params.pointSeparation,
+        windShear: params.windShear,
         ...repOpts,
       });
     } else if (params.shape === 'Wispy') {
@@ -1111,10 +1137,13 @@ async function init() {
   meshFolder.add(meshFileObj, 'loadMesh').name('Upload OBJ (.obj)');
 
   const shapeFolder = gui.addFolder('Shape Settings');
+  shapeFolder.add(params, 'species', ['Humilis', 'Mediocris', 'Congestus', 'Fractus']).name('Species').onChange(regenerate);
   shapeFolder.add(params, 'radiusVariation', 0.0, 1.0, 0.05).name('Radius Var').onChange(regenerate);
   shapeFolder.add(params, 'gridX', 1, 12, 1).name('Grid X').onChange(regenerate);
+  shapeFolder.add(params, 'gridY', 1, 12, 1).name('Grid Y').onChange(regenerate);
   shapeFolder.add(params, 'gridZ', 1, 12, 1).name('Grid Z').onChange(regenerate);
   shapeFolder.add(params, 'pointSeparation', 0.1, 0.5, 0.01).name('Separation').onChange(regenerate);
+  shapeFolder.add(params, 'windShear', -1.0, 1.0, 0.01).name('Wind Shear').onChange(regenerate);
 
   const curveFolder = gui.addFolder('Curve Settings');
   curveFolder.add(params, 'curveType', ['S-Curve', 'Spiral', 'Circle']).name('Curve Type').onChange(regenerate);

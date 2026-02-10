@@ -977,6 +977,17 @@ async function init() {
 
   // Initial texture will be created after params are defined
 
+  // Sampler for trilinear interpolation of SDF texture
+  const sdfSampler = device.createSampler({
+    magFilter: 'linear',
+    minFilter: 'linear',
+    mipmapFilter: 'linear',
+    addressModeU: 'clamp-to-edge',
+    addressModeV: 'clamp-to-edge',
+    addressModeW: 'clamp-to-edge',
+  });
+  console.log('[SDF Sampler] Created trilinear sampler');
+
   // Generate cloud spheres
   let sphereData = generateCumulus();
   let sphereCount = sphereData.length / 4;

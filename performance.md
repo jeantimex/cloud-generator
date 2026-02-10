@@ -176,8 +176,8 @@ After:   cloudSDF(p) → textureSample(sdfTexture, p) → return distance
 ## 4. Task Checklist
 
 ### Phase 1: 3D Texture Infrastructure
-- [ ] Create 3D texture resource
-- [ ] Create trilinear sampler
+- [x] Create 3D texture resource
+- [x] Create trilinear sampler
 - [ ] Update bind group layout
 - [ ] Implement coordinate mapping function
 

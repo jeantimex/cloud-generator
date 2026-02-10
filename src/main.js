@@ -675,6 +675,112 @@ fn bakeSDF(@builtin(global_invocation_id) id : vec3<u32>) {
 }
 `;
 
+// === Compute Shader for AO Baking ===
+const aoBakeShaderCode = `
+struct AOBakeUniforms {
+  boxMin : vec3<f32>,         // 0-11
+  aoSamples : u32,            // 12-15
+  boxMax : vec3<f32>,         // 16-27
+  aoConeAngle : f32,          // 28-31 (in degrees)
+  resolution : u32,           // 32-35
+  aoRadius : f32,             // 36-39
+  aoSteps : u32,              // 40-43
+  _pad : u32,                 // 44-47 (total: 48 bytes)
+};
+
+@binding(0) @group(0) var<uniform> aoUniforms : AOBakeUniforms;
+@binding(1) @group(0) var sdfTexture : texture_3d<f32>;
+@binding(2) @group(0) var sdfSampler : sampler;
+@binding(3) @group(0) var aoTextureWrite : texture_storage_3d<rgba16float, write>;
+
+// Sample SDF texture
+fn sampleSDF(p : vec3<f32>) -> f32 {
+  let uvw = (p - aoUniforms.boxMin) / (aoUniforms.boxMax - aoUniforms.boxMin);
+  return textureSampleLevel(sdfTexture, sdfSampler, uvw, 0.0).r;
+}
+
+// Convert SDF to density
+fn sampleDensity(p : vec3<f32>) -> f32 {
+  let dist = sampleSDF(p);
+  return smoothstep(0.1, -0.1, dist);
+}
+
+// Fibonacci sphere distribution for stratified sampling
+fn fibonacciSphere(index : u32, total : u32) -> vec3<f32> {
+  let phi = 2.399963229728653;  // golden angle in radians
+  let i = f32(index);
+  let n = f32(total);
+  let y = 1.0 - (i / (n - 1.0)) * 2.0;  // y goes from 1 to -1
+  let radius = sqrt(1.0 - y * y);
+  let theta = phi * i;
+  return vec3(cos(theta) * radius, y, sin(theta) * radius);
+}
+
+// Rotate direction to create cone around up vector
+fn rotateToHemisphere(dir : vec3<f32>, coneAngle : f32) -> vec3<f32> {
+  // Scale the horizontal component based on cone angle
+  let coneScale = sin(coneAngle);
+  let verticalScale = cos(coneAngle);
+
+  // Make direction favor upward (positive y) hemisphere
+  let scaledDir = vec3(dir.x * coneScale, abs(dir.y) * verticalScale + (1.0 - verticalScale), dir.z * coneScale);
+  return normalize(scaledDir);
+}
+
+@compute @workgroup_size(4, 4, 4)
+fn bakeAO(@builtin(global_invocation_id) id : vec3<u32>) {
+  let res = aoUniforms.resolution;
+
+  if (id.x >= res || id.y >= res || id.z >= res) {
+    return;
+  }
+
+  // Convert voxel coordinate to world position
+  let uvw = (vec3<f32>(id) + 0.5) / f32(res);
+  let worldPos = mix(aoUniforms.boxMin, aoUniforms.boxMax, uvw);
+
+  // Sample density at this point
+  let centerDensity = sampleDensity(worldPos);
+
+  // If outside cloud, AO = 1.0 (fully visible)
+  if (centerDensity < 0.001) {
+    textureStore(aoTextureWrite, id, vec4(1.0, 0.0, 0.0, 1.0));
+    return;
+  }
+
+  // Cone march in multiple directions
+  let numSamples = aoUniforms.aoSamples;
+  let numSteps = aoUniforms.aoSteps;
+  let maxDist = aoUniforms.aoRadius;
+  let coneAngleRad = aoUniforms.aoConeAngle * 3.14159265 / 180.0;
+  let stepSize = maxDist / f32(numSteps);
+
+  var totalVisibility = 0.0;
+
+  for (var s = 0u; s < numSamples; s++) {
+    // Get stratified direction from Fibonacci sphere
+    let baseDir = fibonacciSphere(s, numSamples);
+    let rayDir = rotateToHemisphere(baseDir, coneAngleRad);
+
+    // March along ray and accumulate density
+    var accumulatedDensity = 0.0;
+    for (var step = 1u; step <= numSteps; step++) {
+      let samplePos = worldPos + rayDir * f32(step) * stepSize;
+      accumulatedDensity += sampleDensity(samplePos) * stepSize;
+    }
+
+    // Convert accumulated density to visibility using Beer's law
+    let visibility = exp(-accumulatedDensity * 5.0);
+    totalVisibility += visibility;
+  }
+
+  // Average visibility across all sample directions
+  let ao = totalVisibility / f32(numSamples);
+
+  textureStore(aoTextureWrite, id, vec4(ao, 0.0, 0.0, 1.0));
+}
+`;
+
 const volumeShaderCode = `
 struct VolumeUniforms {
   viewProjection : mat4x4<f32>,
@@ -710,6 +816,9 @@ struct VolumeUniforms {
   sdfMode : f32,     // 0.0 = dynamic (loop spheres), 1.0 = baked (sample texture)
   noiseBaked : f32,  // 0.0 = compute noise live, 1.0 = noise is baked in texture
   normalEpsilon : f32,
+  aoStrength : f32,
+  aoRemap : f32,
+  aoEnabled : f32,
 };
 
 @binding(0) @group(0) var<uniform> volumeUniforms : VolumeUniforms;
@@ -718,12 +827,20 @@ struct VolumeUniforms {
 @binding(3) @group(0) var sdfSampler : sampler;
 @binding(4) @group(0) var noiseTexture : texture_3d<f32>;
 @binding(5) @group(0) var noiseSampler : sampler;
+@binding(6) @group(0) var aoTexture : texture_3d<f32>;
+@binding(7) @group(0) var aoSampler : sampler;
 
 // Helper: sample baked SDF texture
 // Uses textureSampleLevel (explicit LOD) instead of textureSample to allow non-uniform control flow
 fn sampleBakedSDF(p : vec3<f32>) -> f32 {
   let uvw = (p - volumeUniforms.boxMin) / (volumeUniforms.boxMax - volumeUniforms.boxMin);
   return textureSampleLevel(sdfTexture, sdfSampler, uvw, 0.0).r;
+}
+
+// Helper: sample baked AO texture
+fn sampleAO(p : vec3<f32>) -> f32 {
+  let uvw = (p - volumeUniforms.boxMin) / (volumeUniforms.boxMax - volumeUniforms.boxMin);
+  return textureSampleLevel(aoTexture, aoSampler, uvw, 0.0).r;
 }
 
 // Helper: sample pre-computed noise texture with animation
@@ -1025,8 +1142,18 @@ fn fs_volume(@location(0) worldPos : vec3<f32>) -> @location(0) vec4<f32> {
       let cosTheta = dot(rayDir, lightDir);
       let phase = dualPhase(cosTheta) * 4.0 * 3.14159265;
 
+      // Ambient occlusion
+      var aoFactor = 1.0;
+      if (volumeUniforms.aoEnabled > 0.5) {
+        let rawAO = sampleAO(pos);
+        // Remap AO: aoRemap controls minimum brightness (approximates multiple scattering)
+        aoFactor = mix(volumeUniforms.aoRemap, 1.0, rawAO);
+        // Blend with strength
+        aoFactor = mix(1.0, aoFactor, volumeUniforms.aoStrength);
+      }
+
       // Base lighting: always present
-      let ambient = volumeUniforms.ambient;
+      let ambient = volumeUniforms.ambient * aoFactor;
       let directional = lightTransmittance * 0.7;
       // Silver lining boost: phase > 1 adds extra brightness (forward scattering)
       let phaseBoost = lightTransmittance * max(phase - 1.0, 0.0) * 0.7;
@@ -1249,9 +1376,9 @@ async function init() {
     },
   });
 
-  // Volume uniform buffer: 304 bytes (see VolumeUniforms struct, padded to 16-byte alignment)
+  // Volume uniform buffer: 320 bytes (see VolumeUniforms struct, padded to 16-byte alignment)
   const volumeUniformBuffer = device.createBuffer({
-    size: 304,
+    size: 320,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
@@ -1270,12 +1397,19 @@ async function init() {
     });
     const memoryMB = (resolution ** 3 * 8 / 1024 / 1024).toFixed(1);  // rgba16float = 8 bytes
     console.log(`[SDF Texture] Created ${resolution}³ 3D texture (${memoryMB}MB)`);
+    // Also create AO texture at same resolution
+    if (typeof createAOTexture === 'function') {
+      createAOTexture(resolution);
+    }
     // Rebuild bind groups with new texture
     if (typeof rebuildVolumeBindGroup === 'function') {
       rebuildVolumeBindGroup();
     }
     if (typeof rebuildBakeBindGroup === 'function') {
       rebuildBakeBindGroup();
+    }
+    if (typeof rebuildAOBindGroup === 'function') {
+      rebuildAOBindGroup();
     }
     return sdfTexture;
   }
@@ -1314,6 +1448,33 @@ async function init() {
   });
   console.log('[Noise Sampler] Created trilinear sampler with repeat mode');
 
+  // === 3D AO Texture for baked ambient occlusion ===
+  let aoTexture = null;
+
+  function createAOTexture(resolution) {
+    if (aoTexture) {
+      aoTexture.destroy();
+    }
+    aoTexture = device.createTexture({
+      size: [resolution, resolution, resolution],
+      format: 'rgba16float',  // rgba16float supports both storage binding AND filtering
+      dimension: '3d',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    const memoryMB = (resolution ** 3 * 8 / 1024 / 1024).toFixed(1);  // rgba16float = 8 bytes
+    console.log(`[AO Texture] Created ${resolution}³ 3D texture (${memoryMB}MB)`);
+  }
+
+  // Sampler for AO texture
+  const aoSampler = device.createSampler({
+    magFilter: 'linear',
+    minFilter: 'linear',
+    addressModeU: 'clamp-to-edge',
+    addressModeV: 'clamp-to-edge',
+    addressModeW: 'clamp-to-edge',
+  });
+  console.log('[AO Sampler] Created trilinear sampler');
+
   // === Compute Pipeline for SDF Baking ===
   const sdfBakeShaderModule = device.createShaderModule({
     code: sdfBakeShaderCode,
@@ -1334,6 +1495,27 @@ async function init() {
   });
 
   console.log('[Compute Pipeline] SDF bake pipeline created');
+
+  // === Compute Pipeline for AO Baking ===
+  const aoBakeShaderModule = device.createShaderModule({
+    code: aoBakeShaderCode,
+  });
+
+  const aoBakePipeline = device.createComputePipeline({
+    layout: 'auto',
+    compute: {
+      module: aoBakeShaderModule,
+      entryPoint: 'bakeAO',
+    },
+  });
+
+  // Uniform buffer for AO bake compute shader (AOBakeUniforms struct: 48 bytes)
+  const aoUniformBuffer = device.createBuffer({
+    size: 48,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  console.log('[Compute Pipeline] AO bake pipeline created');
 
   // === Compute Pipeline for 3D Noise Texture Baking ===
   const noiseBakeShaderModule = device.createShaderModule({
@@ -1418,8 +1600,8 @@ async function init() {
   let sdfBakeBindGroup = null;
 
   function rebuildVolumeBindGroup() {
-    if (!sdfTexture) {
-      console.warn('[BindGroup] SDF texture not ready, skipping bind group creation');
+    if (!sdfTexture || !aoTexture) {
+      console.warn('[BindGroup] SDF or AO texture not ready, skipping bind group creation');
       return;
     }
     volumeBindGroup = device.createBindGroup({
@@ -1431,9 +1613,11 @@ async function init() {
         { binding: 3, resource: sdfSampler },
         { binding: 4, resource: noiseTexture.createView() },
         { binding: 5, resource: noiseSampler },
+        { binding: 6, resource: aoTexture.createView() },
+        { binding: 7, resource: aoSampler },
       ],
     });
-    console.log('[BindGroup] Volume bind group created with SDF texture, noise texture, and samplers');
+    console.log('[BindGroup] Volume bind group created with SDF, noise, and AO textures');
   }
 
   function rebuildBakeBindGroup() {
@@ -1452,6 +1636,25 @@ async function init() {
     console.log('[BindGroup] SDF bake bind group created');
   }
 
+  let aoBakeBindGroup = null;
+
+  function rebuildAOBindGroup() {
+    if (!sdfTexture || !aoTexture) {
+      console.warn('[BindGroup] SDF or AO texture not ready, skipping AO bind group creation');
+      return;
+    }
+    aoBakeBindGroup = device.createBindGroup({
+      layout: aoBakePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: aoUniformBuffer } },
+        { binding: 1, resource: sdfTexture.createView() },
+        { binding: 2, resource: sdfSampler },
+        { binding: 3, resource: aoTexture.createView() },
+      ],
+    });
+    console.log('[BindGroup] AO bake bind group created');
+  }
+
   function rebuildSpheres(data) {
     sphereBuffer.destroy();
     sphereData = data;
@@ -1465,6 +1668,7 @@ async function init() {
     device.queue.writeBuffer(sphereBuffer, 0, data);
     rebuildVolumeBindGroup();
     rebuildBakeBindGroup();
+    rebuildAOBindGroup();
   }
 
   // Function to dispatch the SDF bake compute shader
@@ -1550,6 +1754,62 @@ async function init() {
     console.log(`[Bake] Dispatched SDF bake${noiseStr}: ${resolution}³ voxels, ${sphereCount} spheres, ${workgroups}³ workgroups (~${(endTime - startTime).toFixed(1)}ms CPU time)`);
   }
 
+  // Function to dispatch the AO bake compute shader
+  function bakeAOTexture(resolution) {
+    if (!aoBakeBindGroup || !aoTexture || !params.aoEnabled) {
+      console.log('[AO Bake] Skipping AO bake (disabled or not ready)');
+      return;
+    }
+
+    const startTime = performance.now();
+
+    // Update AO uniforms (48 bytes total):
+    const aoUniformData = new ArrayBuffer(48);
+    const floatView = new Float32Array(aoUniformData);
+    const uintView = new Uint32Array(aoUniformData);
+
+    // boxMin (offset 0, 12 bytes)
+    floatView[0] = cloudBounds.min[0];
+    floatView[1] = cloudBounds.min[1];
+    floatView[2] = cloudBounds.min[2];
+    // aoSamples (offset 12, 4 bytes)
+    uintView[3] = params.aoSamples;
+    // boxMax (offset 16, 12 bytes)
+    floatView[4] = cloudBounds.max[0];
+    floatView[5] = cloudBounds.max[1];
+    floatView[6] = cloudBounds.max[2];
+    // aoConeAngle (offset 28, 4 bytes)
+    floatView[7] = params.aoConeAngle;
+    // resolution (offset 32, 4 bytes)
+    uintView[8] = resolution;
+    // aoRadius (offset 36, 4 bytes)
+    floatView[9] = params.aoRadius;
+    // aoSteps (offset 40, 4 bytes)
+    uintView[10] = 8;  // Fixed number of steps per sample direction
+    // _pad (offset 44, 4 bytes)
+    uintView[11] = 0;
+
+    device.queue.writeBuffer(aoUniformBuffer, 0, aoUniformData);
+
+    // Create command encoder and dispatch compute shader
+    const commandEncoder = device.createCommandEncoder();
+    const computePass = commandEncoder.beginComputePass();
+
+    computePass.setPipeline(aoBakePipeline);
+    computePass.setBindGroup(0, aoBakeBindGroup);
+
+    // Dispatch workgroups: ceil(resolution / 4) in each dimension (workgroup size is 4×4×4)
+    const workgroups = Math.ceil(resolution / 4);
+    computePass.dispatchWorkgroups(workgroups, workgroups, workgroups);
+
+    computePass.end();
+    device.queue.submit([commandEncoder.finish()]);
+
+    // Log timing (approximate, doesn't wait for GPU)
+    const endTime = performance.now();
+    console.log(`[AO Bake] Dispatched AO bake: ${resolution}³ voxels, ${params.aoSamples} samples, cone ${params.aoConeAngle}°, radius ${params.aoRadius}, ${workgroups}³ workgroups (~${(endTime - startTime).toFixed(1)}ms CPU time)`);
+  }
+
   canvas.width = window.innerWidth * window.devicePixelRatio;
   canvas.height = window.innerHeight * window.devicePixelRatio;
 
@@ -1619,6 +1879,13 @@ async function init() {
     sdfMode: 'Baked',  // 'Dynamic' or 'Baked'
     bakeNoise: true,   // Bake noise into texture (static) or compute live (animated)
     normalEpsilon: 0.01,  // Epsilon for normal calculation (larger = smoother)
+    // Ambient Occlusion
+    aoEnabled: true,
+    aoStrength: 0.5,
+    aoSamples: 8,
+    aoConeAngle: 60,
+    aoRadius: 0.3,
+    aoRemap: 0.2,
   };
 
   function regenerate() {
@@ -1780,6 +2047,14 @@ async function init() {
   });
   performanceFolder.add(params, 'normalEpsilon', 0.001, 0.05, 0.001).name('Normal Epsilon');
 
+  const aoFolder = gui.addFolder('Ambient Occlusion');
+  aoFolder.add(params, 'aoEnabled').name('Enable AO').onChange(triggerAOBake);
+  aoFolder.add(params, 'aoStrength', 0.0, 1.0, 0.01).name('Strength');
+  aoFolder.add(params, 'aoSamples', [4, 8, 12, 16]).name('Samples').onChange(triggerAOBake);
+  aoFolder.add(params, 'aoConeAngle', 30, 90, 5).name('Cone Angle').onChange(triggerAOBake);
+  aoFolder.add(params, 'aoRadius', 0.1, 1.0, 0.05).name('Radius').onChange(triggerAOBake);
+  aoFolder.add(params, 'aoRemap', 0.0, 1.0, 0.01).name('Remap (Multi-scatter)');
+
   // Helper to get noise parameters for baking
   function getNoiseParams() {
     return {
@@ -1802,6 +2077,13 @@ async function init() {
     const smoothnessValue = params.blendMode === 'Smooth' ? params.smoothness : 0.0;
     const noiseParams = params.bakeNoise ? getNoiseParams() : null;
     bakeSDFTexture(params.sdfResolution, smoothnessValue, noiseParams);
+    // Also bake AO after SDF is ready
+    bakeAOTexture(params.sdfResolution);
+  }
+
+  // Helper to trigger AO-only bake (when AO params change but SDF doesn't need rebake)
+  function triggerAOBake() {
+    bakeAOTexture(params.sdfResolution);
   }
 
   // Create initial SDF texture and bake
@@ -1901,7 +2183,7 @@ async function init() {
       params.sunX, params.sunY, params.sunZ, params.ambient,
       cr, cg, cb, performance.now() / 1000,
       params.timeScale, params.warpStrength, sdfModeValue, noiseBakedValue,
-      params.normalEpsilon,
+      params.normalEpsilon, params.aoStrength, params.aoRemap, params.aoEnabled ? 1.0 : 0.0,
     ]));
 
     const commandEncoder = device.createCommandEncoder();

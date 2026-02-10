@@ -1516,14 +1516,27 @@ async function init() {
   console.log('[SDF Sampler] Created trilinear sampler');
 
   // === 3D Noise Texture for fast animated noise ===
-  const noiseTextureResolution = 64;  // 64³ is enough for noise
-  const noiseTexture = device.createTexture({
-    size: [noiseTextureResolution, noiseTextureResolution, noiseTextureResolution],
-    format: 'rgba16float',
-    dimension: '3d',
-    usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
-  });
-  console.log(`[Noise Texture] Created ${noiseTextureResolution}³ 3D noise texture`);
+  let noiseTexture = null;
+  let currentNoiseResolution = 64;
+
+  function createNoiseTexture(resolution) {
+    if (noiseTexture) {
+      noiseTexture.destroy();
+    }
+    currentNoiseResolution = resolution;
+    noiseTexture = device.createTexture({
+      size: [resolution, resolution, resolution],
+      format: 'rgba16float',
+      dimension: '3d',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    const memoryMB = (resolution ** 3 * 8 / 1024 / 1024).toFixed(1);
+    console.log(`[Noise Texture] Created ${resolution}³ 3D noise texture (${memoryMB}MB)`);
+    return noiseTexture;
+  }
+
+  // Create initial noise texture
+  createNoiseTexture(64);
 
   // Sampler for noise texture with repeat mode (allows seamless tiling for animation)
   const noiseSampler = device.createSampler({
@@ -1624,23 +1637,34 @@ async function init() {
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
-  // Bind group for noise bake compute shader
-  const noiseBakeBindGroup = device.createBindGroup({
-    layout: noiseBakePipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: noiseUniformBuffer } },
-      { binding: 1, resource: noiseTexture.createView() },
-    ],
-  });
+  // Bind group for noise bake compute shader (will be rebuilt when texture changes)
+  let noiseBakeBindGroup = null;
 
-  // Function to bake the 3D noise texture (called once at startup)
-  function bakeNoiseTexture() {
+  function rebuildNoiseBakeBindGroup() {
+    if (!noiseTexture) return;
+    noiseBakeBindGroup = device.createBindGroup({
+      layout: noiseBakePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: noiseUniformBuffer } },
+        { binding: 1, resource: noiseTexture.createView() },
+      ],
+    });
+    console.log('[BindGroup] Noise bake bind group created');
+  }
+
+  // Function to bake the 3D noise texture
+  function bakeNoiseTexture(resolution) {
+    if (!noiseBakeBindGroup) {
+      rebuildNoiseBakeBindGroup();
+    }
+    if (!noiseBakeBindGroup) return;
+
     const startTime = performance.now();
 
     // Update noise uniforms
     const noiseUniformData = new ArrayBuffer(16);
     const uintView = new Uint32Array(noiseUniformData);
-    uintView[0] = noiseTextureResolution;  // resolution
+    uintView[0] = resolution;  // resolution
     uintView[1] = 4;  // octaves (not used directly but available)
     uintView[2] = 0;  // padding
     uintView[3] = 0;  // padding
@@ -1655,18 +1679,19 @@ async function init() {
     computePass.setBindGroup(0, noiseBakeBindGroup);
 
     // Dispatch workgroups: ceil(resolution / 4) in each dimension
-    const workgroups = Math.ceil(noiseTextureResolution / 4);
+    const workgroups = Math.ceil(resolution / 4);
     computePass.dispatchWorkgroups(workgroups, workgroups, workgroups);
 
     computePass.end();
     device.queue.submit([commandEncoder.finish()]);
 
     const endTime = performance.now();
-    console.log(`[Noise Bake] Baked ${noiseTextureResolution}³ noise texture, ${workgroups}³ workgroups (~${(endTime - startTime).toFixed(1)}ms CPU time)`);
+    console.log(`[Noise Bake] Baked ${resolution}³ noise texture, ${workgroups}³ workgroups (~${(endTime - startTime).toFixed(1)}ms CPU time)`);
   }
 
-  // Bake noise texture once at startup
-  bakeNoiseTexture();
+  // Initialize noise bake bind group and bake initial texture
+  rebuildNoiseBakeBindGroup();
+  bakeNoiseTexture(currentNoiseResolution);
   console.log('[Compute Pipeline] Noise bake pipeline created');
 
   // Generate cloud spheres
@@ -1973,6 +1998,7 @@ async function init() {
     sdfResolution: 128,
     sdfMode: 'Baked',  // 'Dynamic' or 'Baked'
     bakeNoise: true,   // Bake noise into texture (static) or compute live (animated)
+    noiseResolution: 64,  // Resolution of the 3D noise texture
     normalEpsilon: 0.01,  // Epsilon for normal calculation (larger = smoother)
     // Ambient Occlusion
     aoEnabled: true,
@@ -2157,6 +2183,12 @@ async function init() {
   performanceFolder.add(params, 'sdfResolution', [32, 64, 128, 256]).name('SDF Resolution').onChange((value) => {
     createSDFTexture(value);
     triggerBake();
+  });
+  performanceFolder.add(params, 'noiseResolution', [32, 64, 128, 256]).name('Noise Resolution').onChange((value) => {
+    createNoiseTexture(value);
+    rebuildNoiseBakeBindGroup();
+    bakeNoiseTexture(value);
+    rebuildVolumeBindGroup();
   });
   performanceFolder.add(params, 'normalEpsilon', 0.001, 0.05, 0.001).name('Normal Epsilon');
 

@@ -189,9 +189,9 @@ After:   cloudSDF(p) → textureSample(sdfTexture, p) → return distance
 - [x] Add profiling/logging
 
 ### Phase 3: Fragment Shader Integration
-- [ ] Add sdfMode uniform
-- [ ] Modify cloudSDF() to sample texture
-- [ ] Add GUI toggle
+- [x] Add sdfMode uniform
+- [x] Modify cloudSDF() to sample texture
+- [x] Add GUI toggle
 - [ ] Verify visual parity
 - [ ] Measure performance improvement
 

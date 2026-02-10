@@ -521,7 +521,7 @@ struct VolumeUniforms {
   time : f32,
   timeScale : f32,
   warpStrength : f32,
-  _pad1 : f32,
+  sdfMode : f32,  // 0.0 = dynamic (loop spheres), 1.0 = baked (sample texture)
   _pad2 : f32,
 };
 
@@ -530,10 +530,11 @@ struct VolumeUniforms {
 @binding(2) @group(0) var sdfTexture : texture_3d<f32>;
 @binding(3) @group(0) var sdfSampler : sampler;
 
-// Helper: sample baked SDF texture (will be used in Phase 3)
+// Helper: sample baked SDF texture
+// Uses textureSampleLevel (explicit LOD) instead of textureSample to allow non-uniform control flow
 fn sampleBakedSDF(p : vec3<f32>) -> f32 {
   let uvw = (p - volumeUniforms.boxMin) / (volumeUniforms.boxMax - volumeUniforms.boxMin);
-  return textureSample(sdfTexture, sdfSampler, uvw).r;
+  return textureSampleLevel(sdfTexture, sdfSampler, uvw, 0.0).r;
 }
 
 struct VertexOutput {
@@ -611,15 +612,24 @@ fn fbm3D(p : vec3<f32>, octaves : i32) -> f32 {
 }
 
 fn cloudSDF(p : vec3<f32>) -> f32 {
-  let k = volumeUniforms.smoothness;
-  var d = 1e10;
-  for (var i = 0u; i < volumeUniforms.sphereCount; i++) {
-    let s = spheres[i];
-    let sd = sphereSDF(p, s.xyz, s.w);
-    if (k > 0.0) {
-      d = smin(d, sd, k);
-    } else {
-      d = min(d, sd);
+  var d : f32;
+
+  // Choose between baked texture or dynamic sphere loop
+  if (volumeUniforms.sdfMode > 0.5) {
+    // Baked mode: sample pre-computed SDF from 3D texture (O(1))
+    d = sampleBakedSDF(p);
+  } else {
+    // Dynamic mode: loop through all spheres (O(n))
+    let k = volumeUniforms.smoothness;
+    d = 1e10;
+    for (var i = 0u; i < volumeUniforms.sphereCount; i++) {
+      let s = spheres[i];
+      let sd = sphereSDF(p, s.xyz, s.w);
+      if (k > 0.0) {
+        d = smin(d, sd, k);
+      } else {
+        d = min(d, sd);
+      }
     }
   }
 
@@ -720,9 +730,6 @@ fn lightMarch(pos : vec3<f32>, lightDir : vec3<f32>, absorption : f32) -> f32 {
 
 @fragment
 fn fs_volume(@location(0) worldPos : vec3<f32>) -> @location(0) vec4<f32> {
-  // Dummy read to ensure texture binding is included (will be used in Phase 3)
-  let _dummy = sampleBakedSDF(vec3(0.0)) * 0.0;
-
   let rayOrigin = volumeUniforms.cameraPosition;
   let rayDir = normalize(worldPos - rayOrigin);
 
@@ -1269,6 +1276,7 @@ async function init() {
     windShear: 0.0,
     // Performance
     sdfResolution: 128,
+    sdfMode: 'Baked',  // 'Dynamic' or 'Baked'
   };
 
   function regenerate() {
@@ -1411,6 +1419,7 @@ async function init() {
   gui.add(params, 'smoothness', 0.05, 1.0, 0.01).name('Smoothness');
 
   const performanceFolder = gui.addFolder('Performance');
+  performanceFolder.add(params, 'sdfMode', ['Dynamic', 'Baked']).name('SDF Mode');
   performanceFolder.add(params, 'sdfResolution', [32, 64, 128, 256]).name('SDF Resolution').onChange((value) => {
     createSDFTexture(value);
     // Re-bake with new resolution
@@ -1509,10 +1518,11 @@ async function init() {
     const cr = ((cc >> 16) & 0xff) / 255;
     const cg = ((cc >> 8) & 0xff) / 255;
     const cb = (cc & 0xff) / 255;
+    const sdfModeValue = params.sdfMode === 'Baked' ? 1.0 : 0.0;
     device.queue.writeBuffer(volumeUniformBuffer, 240, new Float32Array([
       params.sunX, params.sunY, params.sunZ, params.ambient,
       cr, cg, cb, performance.now() / 1000,
-      params.timeScale, params.warpStrength, 0.0, 0.0,
+      params.timeScale, params.warpStrength, sdfModeValue, 0.0,
     ]));
 
     const commandEncoder = device.createCommandEncoder();

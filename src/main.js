@@ -709,6 +709,10 @@ struct VolumeUniforms {
   warpStrength : f32,
   sdfMode : f32,     // 0.0 = dynamic (loop spheres), 1.0 = baked (sample texture)
   noiseBaked : f32,  // 0.0 = compute noise live, 1.0 = noise is baked in texture
+  animationStyle : f32, // 0.0 = Scroll, 1.0 = Morph
+  _pad1 : f32,
+  _pad2 : f32,
+  _pad3 : f32,
 };
 
 @binding(0) @group(0) var<uniform> volumeUniforms : VolumeUniforms;
@@ -717,6 +721,105 @@ struct VolumeUniforms {
 @binding(3) @group(0) var sdfSampler : sampler;
 @binding(4) @group(0) var noiseTexture : texture_3d<f32>;
 @binding(5) @group(0) var noiseSampler : sampler;
+
+// --- 4D Jenkins Hash (Ported from Blender) ---
+fn rot_u32(x: u32, k: u32) -> u32 {
+  return (x << k) | (x >> (32u - k));
+}
+
+fn hash_uint4(kx: u32, ky: u32, kz: u32, kw: u32) -> u32 {
+  var a = 0xdeadbeefu + (4u << 2u) + 13u;
+  var b = a;
+  var c = a;
+  
+  a += kx; b += ky;
+  a -= c; a ^= rot_u32(c, 4u);  c += b;
+  b -= a; b ^= rot_u32(a, 6u);  a += c;
+  c -= b; c ^= rot_u32(b, 8u);  b += a;
+  a -= c; a ^= rot_u32(c, 16u); c += b;
+  b -= a; b ^= rot_u32(a, 19u); a += c;
+  c -= b; c ^= rot_u32(b, 4u);  b += a;
+  
+  a += kz; b += kw;
+  c ^= b; c -= rot_u32(b, 14u);
+  a ^= c; a -= rot_u32(c, 11u);
+  b ^= a; b -= rot_u32(a, 25u);
+  c ^= b; c -= rot_u32(b, 16u);
+  a ^= c; a -= rot_u32(c, 4u);
+  b ^= a; b -= rot_u32(a, 14u);
+  c ^= b; c -= rot_u32(b, 24u);
+  
+  return c;
+}
+
+fn noiseg_4d(hash: u32, x: f32, y: f32, z: f32, w: f32) -> f32 {
+  let h = hash & 31u;
+  let u = select(y, x, h < 24u);
+  let v = select(z, y, h < 16u);
+  let s = select(w, z, h < 8u);
+  return (select(u, -u, (h & 1u) != 0u) + 
+          select(v, -v, (h & 2u) != 0u) + 
+          select(s, -s, (h & 4u) != 0u));
+}
+
+fn fade(t: f32) -> f32 {
+  return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+fn tri_mix(v0: f32, v1: f32, v2: f32, v3: f32, v4: f32, v5: f32, v6: f32, v7: f32, x: f32, y: f32, z: f32) -> f32 {
+  return mix(
+    mix(mix(v0, v1, x), mix(v2, v3, x), y),
+    mix(mix(v4, v5, x), mix(v6, v7, x), y),
+    z
+  );
+}
+
+fn perlin_noise_4d(p: vec4<f32>) -> f32 {
+  let ip = floor(p);
+  let fp = p - ip;
+  
+  let X = u32(i32(ip.x)); let Y = u32(i32(ip.y));
+  let Z = u32(i32(ip.z)); let W = u32(i32(ip.w));
+  
+  let fx = fp.x; let fy = fp.y; let fz = fp.z; let fw = fp.w;
+  let u = fade(fx); let v = fade(fy); let t = fade(fz); let s = fade(fw);
+
+  let v0 = noiseg_4d(hash_uint4(X, Y, Z, W), fx, fy, fz, fw);
+  let v1 = noiseg_4d(hash_uint4(X + 1u, Y, Z, W), fx - 1.0, fy, fz, fw);
+  let v2 = noiseg_4d(hash_uint4(X, Y + 1u, Z, W), fx, fy - 1.0, fz, fw);
+  let v3 = noiseg_4d(hash_uint4(X + 1u, Y + 1u, Z, W), fx - 1.0, fy - 1.0, fz, fw);
+  let v4 = noiseg_4d(hash_uint4(X, Y, Z + 1u, W), fx, fy, fz - 1.0, fw);
+  let v5 = noiseg_4d(hash_uint4(X + 1u, Y, Z + 1u, W), fx - 1.0, fy, fz - 1.0, fw);
+  let v6 = noiseg_4d(hash_uint4(X, Y + 1u, Z + 1u, W), fx, fy - 1.0, fz - 1.0, fw);
+  let v7 = noiseg_4d(hash_uint4(X + 1u, Y + 1u, Z + 1u, W), fx - 1.0, fy - 1.0, fz - 1.0, fw);
+  
+  let v8 = noiseg_4d(hash_uint4(X, Y, Z, W + 1u), fx, fy, fz, fw - 1.0);
+  let v9 = noiseg_4d(hash_uint4(X + 1u, Y, Z, W + 1u), fx - 1.0, fy, fz, fw - 1.0);
+  let v10 = noiseg_4d(hash_uint4(X, Y + 1u, Z, W + 1u), fx, fy - 1.0, fz, fw - 1.0);
+  let v11 = noiseg_4d(hash_uint4(X + 1u, Y + 1u, Z, W + 1u), fx - 1.0, fy - 1.0, fz, fw - 1.0);
+  let v12 = noiseg_4d(hash_uint4(X, Y, Z + 1u, W + 1u), fx, fy, fz - 1.0, fw - 1.0);
+  let v13 = noiseg_4d(hash_uint4(X + 1u, Y, Z + 1u, W + 1u), fx - 1.0, fy, fz - 1.0, fw - 1.0);
+  let v14 = noiseg_4d(hash_uint4(X, Y + 1u, Z + 1u, W + 1u), fx, fy - 1.0, fz - 1.0, fw - 1.0);
+  let v15 = noiseg_4d(hash_uint4(X + 1u, Y + 1u, Z + 1u, W + 1u), fx - 1.0, fy - 1.0, fz - 1.0, fw - 1.0);
+
+  return mix(
+    tri_mix(v0, v1, v2, v3, v4, v5, v6, v7, u, v, t),
+    tri_mix(v8, v9, v10, v11, v12, v13, v14, v15, u, v, t),
+    s
+  );
+}
+
+fn fbm4D(p: vec4<f32>, octaves: i32) -> f32 {
+  var value = 0.0;
+  var amplitude = 0.5;
+  var fscale = 1.0;
+  for (var i = 0; i < octaves; i++) {
+    value += amplitude * perlin_noise_4d(p * fscale);
+    fscale *= 2.0;
+    amplitude *= 0.5;
+  }
+  return value;
+}
 
 // Helper: sample baked SDF texture
 // Uses textureSampleLevel (explicit LOD) instead of textureSample to allow non-uniform control flow
@@ -856,15 +959,25 @@ fn cloudSDF(p : vec3<f32>) -> f32 {
     }
   }
 
-  // === Noise computation using fast texture lookups ===
+  // === Noise computation ===
   let t = volumeUniforms.time * volumeUniforms.timeScale;
-
-  // Domain Warping using pre-computed noise texture (FAST!)
   var warpPos = p;
   let warpStr = volumeUniforms.warpStrength;
+
+  // Domain Warping
   if (warpStr > 0.0) {
-    let warp = domainWarpFast(p, t);
-    warpPos += warp * warpStr;
+    if (volumeUniforms.animationStyle > 0.5) {
+        // Morphing Warp (using 4D noise for warp)
+        let warp = vec3(
+            fbm4D(vec4(p * 1.5, t), 2),
+            fbm4D(vec4(p * 1.5 + vec3(10.0), t), 2),
+            fbm4D(vec4(p * 1.5 + vec3(20.0), t), 2)
+        );
+        warpPos += warp * warpStr;
+    } else {
+        let warp = domainWarpFast(p, t);
+        warpPos += warp * warpStr;
+    }
   }
 
   // Density gradient: erode the SDF based on height (no noise, just math)
@@ -878,19 +991,22 @@ fn cloudSDF(p : vec3<f32>) -> f32 {
     d += heightFrac * gStrength;
   }
 
-  // Billowy noise using pre-computed noise texture (FAST!)
-  let billowyStr = volumeUniforms.billowyStrength;
-  if (billowyStr > 0.0) {
-    let bn = billowyNoiseFast(warpPos, t);
-    d += bn * billowyStr;
+  // Choose animation style for detail noise
+  var billowy : f32;
+  var wispy : f32;
+
+  if (volumeUniforms.animationStyle > 0.5) {
+    // Morphing (4D Procedural Noise)
+    billowy = fbm4D(vec4(warpPos * volumeUniforms.billowyScale, t), 4);
+    wispy = fbm4D(vec4(warpPos * volumeUniforms.wispyScale + vec3(100.0), t), 3);
+  } else {
+    // Scrolling (Fast 3D Texture Noise)
+    billowy = billowyNoiseFast(warpPos, t);
+    wispy = wispyNoiseFast(warpPos, t);
   }
 
-  // Wispy noise using pre-computed noise texture (FAST!)
-  let wispyStr = volumeUniforms.wispyStrength;
-  if (wispyStr > 0.0) {
-    let wn = wispyNoiseFast(warpPos, t);
-    d += wn * wispyStr;
-  }
+  d += billowy * volumeUniforms.billowyStrength;
+  d += wispy * volumeUniforms.wispyStrength;
 
   // Coverage: shift the entire SDF inward (negative = puffier)
   d -= volumeUniforms.coverage;
@@ -1248,9 +1364,9 @@ async function init() {
     },
   });
 
-  // Volume uniform buffer: 288 bytes (see VolumeUniforms struct)
+  // Volume uniform buffer: 304 bytes (see VolumeUniforms struct)
   const volumeUniformBuffer = device.createBuffer({
-    size: 288,
+    size: 304,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
@@ -1601,7 +1717,8 @@ async function init() {
     cloudScale: 1.0,
     blendMode: 'Sharp',
     smoothness: 0.3,
-    timeScale: 0.0,
+    timeScale: 0.1,
+    animationStyle: 'Scrolling',
     warpStrength: 0.15,
     meshResolution: 15,
     customMesh: null,
@@ -1760,6 +1877,7 @@ async function init() {
   appearanceFolder.add(params, 'cloudScale', 0.2, 3.0, 0.05).name('Cloud Scale').onChange(regenerate);
 
   const animationFolder = gui.addFolder('Animation');
+  animationFolder.add(params, 'animationStyle', ['Scrolling', 'Morphing']).name('Style');
   animationFolder.add(params, 'timeScale', 0.0, 1.0, 0.01).name('Evolution Speed');
   animationFolder.add(params, 'warpStrength', 0.0, 1.0, 0.01).name('Warp Strength').onChange(onNoiseChange);
 
@@ -1898,6 +2016,12 @@ async function init() {
       params.sunX, params.sunY, params.sunZ, params.ambient,
       cr, cg, cb, performance.now() / 1000,
       params.timeScale, params.warpStrength, sdfModeValue, noiseBakedValue,
+    ]));
+
+    // animationStyleValue: 0.0 for Scrolling, 1.0 for Morphing
+    const animationStyleValue = params.animationStyle === 'Morphing' ? 1.0 : 0.0;
+    device.queue.writeBuffer(volumeUniformBuffer, 288, new Float32Array([
+      animationStyleValue, 0.0, 0.0, 0.0
     ]));
 
     const commandEncoder = device.createCommandEncoder();

@@ -1763,8 +1763,8 @@ async function init() {
   animationFolder.add(params, 'timeScale', 0.0, 1.0, 0.01).name('Evolution Speed');
   animationFolder.add(params, 'warpStrength', 0.0, 1.0, 0.01).name('Warp Strength').onChange(onNoiseChange);
 
-  gui.add(params, 'blendMode', ['Sharp', 'Smooth']).name('Blend Mode');
-  gui.add(params, 'smoothness', 0.05, 1.0, 0.01).name('Smoothness');
+  gui.add(params, 'blendMode', ['Sharp', 'Smooth']).name('Blend Mode').onChange(triggerBake);
+  gui.add(params, 'smoothness', 0.05, 1.0, 0.01).name('Smoothness').onChange(triggerBake);
 
   const performanceFolder = gui.addFolder('Performance');
   performanceFolder.add(params, 'sdfMode', ['Dynamic', 'Baked']).name('SDF Mode');

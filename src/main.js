@@ -705,26 +705,45 @@ fn sampleDensity(p : vec3<f32>) -> f32 {
   return smoothstep(0.1, -0.1, dist);
 }
 
-// Fibonacci sphere distribution for stratified sampling
+// Fibonacci sphere distribution for stratified sampling (full sphere)
 fn fibonacciSphere(index : u32, total : u32) -> vec3<f32> {
-  let phi = 2.399963229728653;  // golden angle in radians
+  let goldenAngle = 2.399963229728653;  // pi * (3 - sqrt(5))
   let i = f32(index);
   let n = f32(total);
-  let y = 1.0 - (i / (n - 1.0)) * 2.0;  // y goes from 1 to -1
-  let radius = sqrt(1.0 - y * y);
-  let theta = phi * i;
-  return vec3(cos(theta) * radius, y, sin(theta) * radius);
+
+  // Handle edge case of single sample
+  if (n <= 1.0) {
+    return vec3(0.0, 1.0, 0.0);  // Point straight up
+  }
+
+  // y goes from 1 to -1 (full sphere)
+  let y = 1.0 - (i / (n - 1.0)) * 2.0;
+  let radiusAtY = sqrt(max(0.0, 1.0 - y * y));
+  let theta = goldenAngle * i;
+
+  return vec3(cos(theta) * radiusAtY, y, sin(theta) * radiusAtY);
 }
 
-// Rotate direction to create cone around up vector
-fn rotateToHemisphere(dir : vec3<f32>, coneAngle : f32) -> vec3<f32> {
-  // Scale the horizontal component based on cone angle
-  let coneScale = sin(coneAngle);
-  let verticalScale = cos(coneAngle);
+// Fibonacci hemisphere distribution (upper hemisphere only, for directional AO)
+fn fibonacciHemisphere(index : u32, total : u32, coneAngleDeg : f32) -> vec3<f32> {
+  let goldenAngle = 2.399963229728653;
+  let i = f32(index);
+  let n = f32(total);
 
-  // Make direction favor upward (positive y) hemisphere
-  let scaledDir = vec3(dir.x * coneScale, abs(dir.y) * verticalScale + (1.0 - verticalScale), dir.z * coneScale);
-  return normalize(scaledDir);
+  if (n <= 1.0) {
+    return vec3(0.0, 1.0, 0.0);
+  }
+
+  // Convert cone angle to cosine (90° = hemisphere, smaller = narrower cone)
+  let maxCosTheta = cos(coneAngleDeg * 3.14159265 / 180.0);
+
+  // Distribute y from 1 (up) to maxCosTheta (edge of cone)
+  // Using stratified distribution for better coverage
+  let y = 1.0 - i / n * (1.0 - maxCosTheta);
+  let radiusAtY = sqrt(max(0.0, 1.0 - y * y));
+  let theta = goldenAngle * i;
+
+  return vec3(cos(theta) * radiusAtY, y, sin(theta) * radiusAtY);
 }
 
 @compute @workgroup_size(4, 4, 4)
@@ -748,29 +767,39 @@ fn bakeAO(@builtin(global_invocation_id) id : vec3<u32>) {
     return;
   }
 
-  // Cone march in multiple directions
   let numSamples = aoUniforms.aoSamples;
   let numSteps = aoUniforms.aoSteps;
   let maxDist = aoUniforms.aoRadius;
-  let coneAngleRad = aoUniforms.aoConeAngle * 3.14159265 / 180.0;
+  let coneAngle = aoUniforms.aoConeAngle;
   let stepSize = maxDist / f32(numSteps);
+
+  // Absorption coefficient - controls how quickly density blocks light
+  let absorptionCoeff = 8.0;
 
   var totalVisibility = 0.0;
 
   for (var s = 0u; s < numSamples; s++) {
-    // Get stratified direction from Fibonacci sphere
-    let baseDir = fibonacciSphere(s, numSamples);
-    let rayDir = rotateToHemisphere(baseDir, coneAngleRad);
+    // Get stratified direction from hemisphere/cone
+    // coneAngle = 90 means full hemisphere, smaller = narrower cone around up
+    let rayDir = fibonacciHemisphere(s, numSamples, coneAngle);
 
-    // March along ray and accumulate density
-    var accumulatedDensity = 0.0;
+    // March along ray and accumulate optical depth (density * distance)
+    var opticalDepth = 0.0;
     for (var step = 1u; step <= numSteps; step++) {
-      let samplePos = worldPos + rayDir * f32(step) * stepSize;
-      accumulatedDensity += sampleDensity(samplePos) * stepSize;
+      let t = f32(step) * stepSize;
+      let samplePos = worldPos + rayDir * t;
+
+      // Check bounds - if outside volume, stop marching
+      let sampleUvw = (samplePos - aoUniforms.boxMin) / (aoUniforms.boxMax - aoUniforms.boxMin);
+      if (any(sampleUvw < vec3(0.0)) || any(sampleUvw > vec3(1.0))) {
+        break;
+      }
+
+      opticalDepth += sampleDensity(samplePos) * stepSize;
     }
 
-    // Convert accumulated density to visibility using Beer's law
-    let visibility = exp(-accumulatedDensity * 5.0);
+    // Beer-Lambert law: transmittance = exp(-absorption * optical_depth)
+    let visibility = exp(-opticalDepth * absorptionCoeff);
     totalVisibility += visibility;
   }
 
@@ -1836,21 +1865,21 @@ async function init() {
     children: 4,
     keepProb: 0.5,
     scaleMult: 0.55,
-    seed: 42,
+    seed: 47,
     gradientBottom: -0.2,
     gradientTop: 0.5,
-    gradientStrength: 0.0,
-    billowyScale: 0.0,
-    billowyStrength: 0.0,
-    wispyScale: 0.0,
-    wispyStrength: 0.0,
-    coverage: 0.0,
+    gradientStrength: 0.25,
+    billowyScale: 2.5,
+    billowyStrength: 0.4,
+    wispyScale: 8.0,
+    wispyStrength: 0.2,
+    coverage: 0.05,
     zPadding: 0.0,
     flipZ: false,
     absorption: 5.0,
     renderSteps: 64,
     lightSteps: 6,
-    renderMode: 'Surface',
+    renderMode: 'Volume',
     anisotropy1: 0.5,
     anisotropy2: -0.3,
     phaseBlend: 0.5,
@@ -1861,7 +1890,7 @@ async function init() {
     cloudColor: '#ffffff',
     cloudScale: 1.0,
     blendMode: 'Sharp',
-    smoothness: 0.3,
+    smoothness: 0.25,
     timeScale: 0.0,
     warpStrength: 0.15,
     meshResolution: 15,
@@ -2091,8 +2120,8 @@ async function init() {
   triggerBake();
 
   // Orbit camera state
-  let orbitTheta = Math.PI / 4;   // horizontal angle
-  let orbitPhi = Math.PI / 4;     // vertical angle (from top)
+  let orbitTheta = Math.PI * 80 / 180; // horizontal angle (80 degrees)
+  let orbitPhi = Math.PI * 90 / 180;  // vertical angle (90 degrees from top)
   let orbitDistance = 4;
   let isDragging = false;
   let lastMouseX = 0;

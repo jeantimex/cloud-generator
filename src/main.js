@@ -431,6 +431,86 @@ fn fs_main() -> @location(0) vec4<f32> {
 }
 `;
 
+// === Compute Shader for 3D Noise Texture Baking ===
+const noiseBakeShaderCode = `
+struct NoiseUniforms {
+  resolution : u32,
+  octaves : u32,
+  _pad1 : u32,
+  _pad2 : u32,
+};
+
+@binding(0) @group(0) var<uniform> noiseUniforms : NoiseUniforms;
+@binding(1) @group(0) var noiseTextureWrite : texture_storage_3d<rgba16float, write>;
+
+// Noise functions for baking
+fn hash33_noise(p : vec3<f32>) -> vec3<f32> {
+  var q = vec3(
+    dot(p, vec3(127.1, 311.7, 74.7)),
+    dot(p, vec3(269.5, 183.3, 246.1)),
+    dot(p, vec3(113.5, 271.9, 124.6)),
+  );
+  return fract(sin(q) * 43758.5453123) * 2.0 - 1.0;
+}
+
+fn noise3D_bake(p : vec3<f32>) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * (3.0 - 2.0 * f);
+
+  return mix(
+    mix(
+      mix(dot(hash33_noise(i + vec3(0.0, 0.0, 0.0)), f - vec3(0.0, 0.0, 0.0)),
+          dot(hash33_noise(i + vec3(1.0, 0.0, 0.0)), f - vec3(1.0, 0.0, 0.0)), u.x),
+      mix(dot(hash33_noise(i + vec3(0.0, 1.0, 0.0)), f - vec3(0.0, 1.0, 0.0)),
+          dot(hash33_noise(i + vec3(1.0, 1.0, 0.0)), f - vec3(1.0, 1.0, 0.0)), u.x), u.y),
+    mix(
+      mix(dot(hash33_noise(i + vec3(0.0, 0.0, 1.0)), f - vec3(0.0, 0.0, 1.0)),
+          dot(hash33_noise(i + vec3(1.0, 0.0, 1.0)), f - vec3(1.0, 0.0, 1.0)), u.x),
+      mix(dot(hash33_noise(i + vec3(0.0, 1.0, 1.0)), f - vec3(0.0, 1.0, 1.0)),
+          dot(hash33_noise(i + vec3(1.0, 1.0, 1.0)), f - vec3(1.0, 1.0, 1.0)), u.x), u.y),
+    u.z);
+}
+
+fn fbm3D_noise(p : vec3<f32>, octaves : i32) -> f32 {
+  var value = 0.0;
+  var amplitude = 0.5;
+  var frequency = 1.0;
+  for (var i = 0; i < octaves; i++) {
+    value += amplitude * noise3D_bake(p * frequency);
+    frequency *= 2.0;
+    amplitude *= 0.5;
+  }
+  return value;
+}
+
+@compute @workgroup_size(4, 4, 4)
+fn bakeNoise3D(@builtin(global_invocation_id) id : vec3<u32>) {
+  let res = noiseUniforms.resolution;
+
+  if (id.x >= res || id.y >= res || id.z >= res) {
+    return;
+  }
+
+  // Normalize to [0, 1] then scale to create tileable noise
+  // Using a scale that tiles well (e.g., 4.0 means 4 periods across the texture)
+  let uvw = vec3<f32>(id) / f32(res);
+  let noiseCoord = uvw * 8.0;  // 8 periods for good detail
+
+  // Compute different noise values for different uses
+  // .r = billowy noise (4 octaves)
+  // .g = wispy noise (3 octaves)
+  // .b = warp noise X
+  // .a = warp noise Y (we'll compute Z from a different sample)
+  let billowy = fbm3D_noise(noiseCoord, 4);
+  let wispy = fbm3D_noise(noiseCoord + vec3(100.0, 0.0, 0.0), 3);
+  let warpX = fbm3D_noise(noiseCoord + vec3(0.0, 100.0, 0.0), 3);
+  let warpY = fbm3D_noise(noiseCoord + vec3(0.0, 0.0, 100.0), 3);
+
+  textureStore(noiseTextureWrite, id, vec4(billowy, wispy, warpX, warpY));
+}
+`;
+
 // === Compute Shader for SDF Baking ===
 const sdfBakeShaderCode = `
 struct BakeUniforms {
@@ -635,12 +715,44 @@ struct VolumeUniforms {
 @binding(1) @group(0) var<storage, read> spheres : array<vec4<f32>>;
 @binding(2) @group(0) var sdfTexture : texture_3d<f32>;
 @binding(3) @group(0) var sdfSampler : sampler;
+@binding(4) @group(0) var noiseTexture : texture_3d<f32>;
+@binding(5) @group(0) var noiseSampler : sampler;
 
 // Helper: sample baked SDF texture
 // Uses textureSampleLevel (explicit LOD) instead of textureSample to allow non-uniform control flow
 fn sampleBakedSDF(p : vec3<f32>) -> f32 {
   let uvw = (p - volumeUniforms.boxMin) / (volumeUniforms.boxMax - volumeUniforms.boxMin);
   return textureSampleLevel(sdfTexture, sdfSampler, uvw, 0.0).r;
+}
+
+// Helper: sample pre-computed noise texture with animation
+// The noise texture tiles seamlessly, so we can animate by offsetting coordinates
+// Returns vec4: .r = billowy, .g = wispy, .b = warpX, .a = warpY
+fn sampleNoise3D(p : vec3<f32>, scale : f32, timeOffset : vec3<f32>) -> vec4<f32> {
+  // Scale position and add time-based offset for animation
+  // The noise texture has 8 periods baked in, so we divide by 8 to get proper tiling
+  let uvw = fract((p * scale + timeOffset) / 8.0);
+  return textureSampleLevel(noiseTexture, noiseSampler, uvw, 0.0);
+}
+
+// Fast billowy noise using pre-computed texture
+fn billowyNoiseFast(p : vec3<f32>, t : f32) -> f32 {
+  let noiseVal = sampleNoise3D(p, volumeUniforms.billowyScale, vec3(0.0, -t * 0.5, 0.0));
+  return noiseVal.r;
+}
+
+// Fast wispy noise using pre-computed texture
+fn wispyNoiseFast(p : vec3<f32>, t : f32) -> f32 {
+  let noiseVal = sampleNoise3D(p, volumeUniforms.wispyScale, vec3(t, t * 0.2, 0.0));
+  return noiseVal.g;
+}
+
+// Fast domain warp using pre-computed texture
+fn domainWarpFast(p : vec3<f32>, t : f32) -> vec3<f32> {
+  let noiseVal = sampleNoise3D(p, 1.5, vec3(t, 0.0, 0.0));
+  // Sample Z warp from a different location
+  let noiseValZ = sampleNoise3D(p + vec3(50.0, 0.0, 0.0), 1.5, vec3(0.0, 0.0, t));
+  return vec3(noiseVal.b, noiseVal.a, noiseValZ.b);
 }
 
 struct VertexOutput {
@@ -744,21 +856,18 @@ fn cloudSDF(p : vec3<f32>) -> f32 {
     }
   }
 
-  // === Noise computation (skipped if noise is baked) ===
+  // === Noise computation using fast texture lookups ===
   let t = volumeUniforms.time * volumeUniforms.timeScale;
 
-  // Domain Warping: Offset the noise coordinates with another noise function
-  // This creates the "swirling" and "wispy curls" characteristic of Houdini clouds.
+  // Domain Warping using pre-computed noise texture (FAST!)
   var warpPos = p;
   let warpStr = volumeUniforms.warpStrength;
   if (warpStr > 0.0) {
-    let warpX = fbm3D(p * 1.5 + vec3(t, 0.0, 0.0), 3);
-    let warpY = fbm3D(p * 1.5 + vec3(0.0, t, 0.0), 3);
-    let warpZ = fbm3D(p * 1.5 + vec3(0.0, 0.0, t), 3);
-    warpPos += vec3(warpX, warpY, warpZ) * warpStr;
+    let warp = domainWarpFast(p, t);
+    warpPos += warp * warpStr;
   }
 
-  // Density gradient: erode the SDF based on height
+  // Density gradient: erode the SDF based on height (no noise, just math)
   let gStrength = volumeUniforms.gradientStrength;
   if (gStrength > 0.0) {
     var heightFrac = smoothstep(volumeUniforms.gradientBottom, volumeUniforms.gradientTop, p.y);
@@ -769,17 +878,17 @@ fn cloudSDF(p : vec3<f32>) -> f32 {
     d += heightFrac * gStrength;
   }
 
-  // Billowy noise: large-scale deformation (cauliflower bumps)
+  // Billowy noise using pre-computed noise texture (FAST!)
   let billowyStr = volumeUniforms.billowyStrength;
   if (billowyStr > 0.0) {
-    let bn = fbm3D(warpPos * volumeUniforms.billowyScale + vec3(0.0, -t * 0.5, 0.0), 4);
+    let bn = billowyNoiseFast(warpPos, t);
     d += bn * billowyStr;
   }
 
-  // Wispy noise: fine detail erosion at edges
+  // Wispy noise using pre-computed noise texture (FAST!)
   let wispyStr = volumeUniforms.wispyStrength;
   if (wispyStr > 0.0) {
-    let wn = fbm3D(warpPos * volumeUniforms.wispyScale + vec3(t, t * 0.2, 0.0), 3);
+    let wn = wispyNoiseFast(warpPos, t);
     d += wn * wispyStr;
   }
 
@@ -1183,6 +1292,27 @@ async function init() {
   });
   console.log('[SDF Sampler] Created trilinear sampler');
 
+  // === 3D Noise Texture for fast animated noise ===
+  const noiseTextureResolution = 64;  // 64³ is enough for noise
+  const noiseTexture = device.createTexture({
+    size: [noiseTextureResolution, noiseTextureResolution, noiseTextureResolution],
+    format: 'rgba16float',
+    dimension: '3d',
+    usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+  });
+  console.log(`[Noise Texture] Created ${noiseTextureResolution}³ 3D noise texture`);
+
+  // Sampler for noise texture with repeat mode (allows seamless tiling for animation)
+  const noiseSampler = device.createSampler({
+    magFilter: 'linear',
+    minFilter: 'linear',
+    mipmapFilter: 'linear',
+    addressModeU: 'repeat',
+    addressModeV: 'repeat',
+    addressModeW: 'repeat',
+  });
+  console.log('[Noise Sampler] Created trilinear sampler with repeat mode');
+
   // === Compute Pipeline for SDF Baking ===
   const sdfBakeShaderModule = device.createShaderModule({
     code: sdfBakeShaderCode,
@@ -1203,6 +1333,70 @@ async function init() {
   });
 
   console.log('[Compute Pipeline] SDF bake pipeline created');
+
+  // === Compute Pipeline for 3D Noise Texture Baking ===
+  const noiseBakeShaderModule = device.createShaderModule({
+    code: noiseBakeShaderCode,
+  });
+
+  const noiseBakePipeline = device.createComputePipeline({
+    layout: 'auto',
+    compute: {
+      module: noiseBakeShaderModule,
+      entryPoint: 'bakeNoise3D',
+    },
+  });
+
+  // Uniform buffer for noise bake (NoiseUniforms struct: 16 bytes)
+  const noiseUniformBuffer = device.createBuffer({
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  // Bind group for noise bake compute shader
+  const noiseBakeBindGroup = device.createBindGroup({
+    layout: noiseBakePipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: noiseUniformBuffer } },
+      { binding: 1, resource: noiseTexture.createView() },
+    ],
+  });
+
+  // Function to bake the 3D noise texture (called once at startup)
+  function bakeNoiseTexture() {
+    const startTime = performance.now();
+
+    // Update noise uniforms
+    const noiseUniformData = new ArrayBuffer(16);
+    const uintView = new Uint32Array(noiseUniformData);
+    uintView[0] = noiseTextureResolution;  // resolution
+    uintView[1] = 4;  // octaves (not used directly but available)
+    uintView[2] = 0;  // padding
+    uintView[3] = 0;  // padding
+
+    device.queue.writeBuffer(noiseUniformBuffer, 0, noiseUniformData);
+
+    // Dispatch compute shader
+    const commandEncoder = device.createCommandEncoder();
+    const computePass = commandEncoder.beginComputePass();
+
+    computePass.setPipeline(noiseBakePipeline);
+    computePass.setBindGroup(0, noiseBakeBindGroup);
+
+    // Dispatch workgroups: ceil(resolution / 4) in each dimension
+    const workgroups = Math.ceil(noiseTextureResolution / 4);
+    computePass.dispatchWorkgroups(workgroups, workgroups, workgroups);
+
+    computePass.end();
+    device.queue.submit([commandEncoder.finish()]);
+
+    const endTime = performance.now();
+    console.log(`[Noise Bake] Baked ${noiseTextureResolution}³ noise texture, ${workgroups}³ workgroups (~${(endTime - startTime).toFixed(1)}ms CPU time)`);
+  }
+
+  // Bake noise texture once at startup
+  bakeNoiseTexture();
+  console.log('[Compute Pipeline] Noise bake pipeline created');
 
   // Generate cloud spheres
   let sphereData = generateCumulus();
@@ -1234,9 +1428,11 @@ async function init() {
         { binding: 1, resource: { buffer: sphereBuffer } },
         { binding: 2, resource: sdfTexture.createView() },
         { binding: 3, resource: sdfSampler },
+        { binding: 4, resource: noiseTexture.createView() },
+        { binding: 5, resource: noiseSampler },
       ],
     });
-    console.log('[BindGroup] Volume bind group created with SDF texture and sampler');
+    console.log('[BindGroup] Volume bind group created with SDF texture, noise texture, and samplers');
   }
 
   function rebuildBakeBindGroup() {

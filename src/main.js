@@ -1696,7 +1696,8 @@ async function init() {
     const cg = ((cc >> 8) & 0xff) / 255;
     const cb = (cc & 0xff) / 255;
     const sdfModeValue = params.sdfMode === 'Baked' ? 1.0 : 0.0;
-    const noiseBakedValue = (params.sdfMode === 'Baked' && params.bakeNoise) ? 1.0 : 0.0;
+    // Don't use baked noise if animation is enabled (timeScale > 0) - need live computation for animation
+    const noiseBakedValue = (params.sdfMode === 'Baked' && params.bakeNoise && params.timeScale === 0) ? 1.0 : 0.0;
     device.queue.writeBuffer(volumeUniformBuffer, 240, new Float32Array([
       params.sunX, params.sunY, params.sunZ, params.ambient,
       cr, cg, cb, performance.now() / 1000,

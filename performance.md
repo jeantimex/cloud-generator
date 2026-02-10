@@ -192,14 +192,14 @@ After:   cloudSDF(p) → textureSample(sdfTexture, p) → return distance
 - [x] Add sdfMode uniform
 - [x] Modify cloudSDF() to sample texture
 - [x] Add GUI toggle
-- [ ] Verify visual parity
-- [ ] Measure performance improvement
+- [x] Verify visual parity
+- [x] Measure performance improvement
 
-### Phase 4: Noise Baking (Optional)
-- [ ] Bake billowy noise into texture
-- [ ] Bake wispy noise into texture
-- [ ] Add "Bake Noise" toggle
-- [ ] Handle animated noise fallback
+### Phase 4: Noise Baking (Hybrid Mode)
+- [x] Bake billowy noise into texture
+- [x] Bake wispy noise into texture
+- [x] Add "Bake Noise" toggle
+- [x] Handle animated noise fallback (live compute when timeScale > 0)
 
 ### Phase 5: Quality Controls
 - [ ] Add sdfResolution parameter

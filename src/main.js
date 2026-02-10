@@ -434,14 +434,26 @@ fn fs_main() -> @location(0) vec4<f32> {
 // === Compute Shader for SDF Baking ===
 const sdfBakeShaderCode = `
 struct BakeUniforms {
-  boxMin : vec3<f32>,
-  sphereCount : u32,
-  boxMax : vec3<f32>,
-  smoothness : f32,
-  resolution : u32,
-  _pad1 : u32,
-  _pad2 : u32,
-  _pad3 : u32,
+  boxMin : vec3<f32>,         // 0-11
+  sphereCount : u32,          // 12-15
+  boxMax : vec3<f32>,         // 16-27
+  smoothness : f32,           // 28-31
+  resolution : u32,           // 32-35
+  bakeNoise : u32,            // 36-39 (0 = no noise, 1 = bake noise)
+  billowyScale : f32,         // 40-43
+  billowyStrength : f32,      // 44-47
+  wispyScale : f32,           // 48-51
+  wispyStrength : f32,        // 52-55
+  coverage : f32,             // 56-59
+  gradientStrength : f32,     // 60-63
+  gradientBottom : f32,       // 64-67
+  gradientTop : f32,          // 68-71
+  warpStrength : f32,         // 72-75
+  flipZ : f32,                // 76-79
+  zPadding : f32,             // 80-83
+  _pad1 : f32,                // 84-87
+  _pad2 : f32,                // 88-91
+  _pad3 : f32,                // 92-95 (total: 96 bytes)
 };
 
 @binding(0) @group(0) var<uniform> bakeUniforms : BakeUniforms;
@@ -455,6 +467,47 @@ fn sphereSDF(p : vec3<f32>, center : vec3<f32>, radius : f32) -> f32 {
 fn smin(a : f32, b : f32, k : f32) -> f32 {
   let h = max(k - abs(a - b), 0.0) / k;
   return min(a, b) - h * h * k * 0.25;
+}
+
+// Noise functions for baking
+fn hash33(p : vec3<f32>) -> vec3<f32> {
+  var q = vec3(
+    dot(p, vec3(127.1, 311.7, 74.7)),
+    dot(p, vec3(269.5, 183.3, 246.1)),
+    dot(p, vec3(113.5, 271.9, 124.6)),
+  );
+  return fract(sin(q) * 43758.5453123) * 2.0 - 1.0;
+}
+
+fn noise3D(p : vec3<f32>) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * (3.0 - 2.0 * f);
+
+  return mix(
+    mix(
+      mix(dot(hash33(i + vec3(0.0, 0.0, 0.0)), f - vec3(0.0, 0.0, 0.0)),
+          dot(hash33(i + vec3(1.0, 0.0, 0.0)), f - vec3(1.0, 0.0, 0.0)), u.x),
+      mix(dot(hash33(i + vec3(0.0, 1.0, 0.0)), f - vec3(0.0, 1.0, 0.0)),
+          dot(hash33(i + vec3(1.0, 1.0, 0.0)), f - vec3(1.0, 1.0, 0.0)), u.x), u.y),
+    mix(
+      mix(dot(hash33(i + vec3(0.0, 0.0, 1.0)), f - vec3(0.0, 0.0, 1.0)),
+          dot(hash33(i + vec3(1.0, 0.0, 1.0)), f - vec3(1.0, 0.0, 1.0)), u.x),
+      mix(dot(hash33(i + vec3(0.0, 1.0, 1.0)), f - vec3(0.0, 1.0, 1.0)),
+          dot(hash33(i + vec3(1.0, 1.0, 1.0)), f - vec3(1.0, 1.0, 1.0)), u.x), u.y),
+    u.z);
+}
+
+fn fbm3D_bake(p : vec3<f32>, octaves : i32) -> f32 {
+  var value = 0.0;
+  var amplitude = 0.5;
+  var frequency = 1.0;
+  for (var i = 0; i < octaves; i++) {
+    value += amplitude * noise3D(p * frequency);
+    frequency *= 2.0;
+    amplitude *= 0.5;
+  }
+  return value;
 }
 
 @compute @workgroup_size(4, 4, 4)
@@ -481,6 +534,59 @@ fn bakeSDF(@builtin(global_invocation_id) id : vec3<u32>) {
       d = smin(d, sd, k);
     } else {
       d = min(d, sd);
+    }
+  }
+
+  // Optionally bake noise into the SDF
+  if (bakeUniforms.bakeNoise > 0u) {
+    let p = worldPos;
+
+    // Domain warping
+    var warpPos = p;
+    let warpStr = bakeUniforms.warpStrength;
+    if (warpStr > 0.0) {
+      let warpX = fbm3D_bake(p * 1.5, 3);
+      let warpY = fbm3D_bake(p * 1.5 + vec3(100.0, 0.0, 0.0), 3);
+      let warpZ = fbm3D_bake(p * 1.5 + vec3(0.0, 100.0, 0.0), 3);
+      warpPos += vec3(warpX, warpY, warpZ) * warpStr;
+    }
+
+    // Density gradient
+    let gStrength = bakeUniforms.gradientStrength;
+    if (gStrength > 0.0) {
+      var heightFrac = smoothstep(bakeUniforms.gradientBottom, bakeUniforms.gradientTop, p.y);
+      if (bakeUniforms.flipZ > 0.5) {
+        heightFrac = 1.0 - heightFrac;
+      }
+      d += heightFrac * gStrength;
+    }
+
+    // Billowy noise
+    let billowyStr = bakeUniforms.billowyStrength;
+    if (billowyStr > 0.0) {
+      let bn = fbm3D_bake(warpPos * bakeUniforms.billowyScale, 4);
+      d += bn * billowyStr;
+    }
+
+    // Wispy noise
+    let wispyStr = bakeUniforms.wispyStrength;
+    if (wispyStr > 0.0) {
+      let wn = fbm3D_bake(warpPos * bakeUniforms.wispyScale, 3);
+      d += wn * wispyStr;
+    }
+
+    // Coverage
+    d -= bakeUniforms.coverage;
+
+    // Z-padding
+    let zPad = bakeUniforms.zPadding;
+    if (zPad > 0.0) {
+      let bMin = bakeUniforms.boxMin.y;
+      let bMax = bakeUniforms.boxMax.y;
+      let clipBottom = smoothstep(bMin, bMin + zPad, p.y);
+      let clipTop = smoothstep(bMax, bMax - zPad, p.y);
+      let clipMask = clipBottom * clipTop;
+      d += (1.0 - clipMask) * 0.5;
     }
   }
 
@@ -521,8 +627,8 @@ struct VolumeUniforms {
   time : f32,
   timeScale : f32,
   warpStrength : f32,
-  sdfMode : f32,  // 0.0 = dynamic (loop spheres), 1.0 = baked (sample texture)
-  _pad2 : f32,
+  sdfMode : f32,     // 0.0 = dynamic (loop spheres), 1.0 = baked (sample texture)
+  noiseBaked : f32,  // 0.0 = compute noise live, 1.0 = noise is baked in texture
 };
 
 @binding(0) @group(0) var<uniform> volumeUniforms : VolumeUniforms;
@@ -618,6 +724,11 @@ fn cloudSDF(p : vec3<f32>) -> f32 {
   if (volumeUniforms.sdfMode > 0.5) {
     // Baked mode: sample pre-computed SDF from 3D texture (O(1))
     d = sampleBakedSDF(p);
+
+    // If noise is baked, skip all noise computation - just return the sampled value
+    if (volumeUniforms.noiseBaked > 0.5) {
+      return d;
+    }
   } else {
     // Dynamic mode: loop through all spheres (O(n))
     let k = volumeUniforms.smoothness;
@@ -633,8 +744,9 @@ fn cloudSDF(p : vec3<f32>) -> f32 {
     }
   }
 
+  // === Noise computation (skipped if noise is baked) ===
   let t = volumeUniforms.time * volumeUniforms.timeScale;
-  
+
   // Domain Warping: Offset the noise coordinates with another noise function
   // This creates the "swirling" and "wispy curls" characteristic of Houdini clouds.
   var warpPos = p;
@@ -1084,9 +1196,9 @@ async function init() {
     },
   });
 
-  // Uniform buffer for bake compute shader (BakeUniforms struct: 48 bytes)
+  // Uniform buffer for bake compute shader (BakeUniforms struct: 96 bytes, aligned to 16)
   const bakeUniformBuffer = device.createBuffer({
-    size: 48,  // boxMin(12) + sphereCount(4) + boxMax(12) + smoothness(4) + resolution(4) + padding(12) = 48 bytes
+    size: 96,  // Extended to include noise parameters, aligned to 16 bytes
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
@@ -1159,17 +1271,17 @@ async function init() {
   }
 
   // Function to dispatch the SDF bake compute shader
-  function bakeSDFTexture(resolution, smoothness) {
+  function bakeSDFTexture(resolution, smoothness, noiseParams = null) {
     if (!sdfBakeBindGroup || !sdfTexture) {
       console.warn('[Bake] Bind group or texture not ready, skipping bake');
       return;
     }
 
     const startTime = performance.now();
+    const bakeNoise = noiseParams !== null;
 
-    // Update bake uniforms (48 bytes total):
-    // boxMin(vec3, 12) + sphereCount(u32, 4) + boxMax(vec3, 12) + smoothness(f32, 4) + resolution(u32, 4) + padding(12)
-    const bakeUniformData = new ArrayBuffer(48);
+    // Update bake uniforms (96 bytes total, aligned to 16):
+    const bakeUniformData = new ArrayBuffer(96);
     const floatView = new Float32Array(bakeUniformData);
     const uintView = new Uint32Array(bakeUniformData);
 
@@ -1187,7 +1299,37 @@ async function init() {
     floatView[7] = smoothness;
     // resolution (offset 32, 4 bytes)
     uintView[8] = resolution;
-    // padding at offset 36-47 (automatically zero)
+    // bakeNoise (offset 36, 4 bytes)
+    uintView[9] = bakeNoise ? 1 : 0;
+
+    if (bakeNoise && noiseParams) {
+      // billowyScale (offset 40)
+      floatView[10] = noiseParams.billowyScale;
+      // billowyStrength (offset 44)
+      floatView[11] = noiseParams.billowyStrength;
+      // wispyScale (offset 48)
+      floatView[12] = noiseParams.wispyScale;
+      // wispyStrength (offset 52)
+      floatView[13] = noiseParams.wispyStrength;
+      // coverage (offset 56)
+      floatView[14] = noiseParams.coverage;
+      // gradientStrength (offset 60)
+      floatView[15] = noiseParams.gradientStrength;
+      // gradientBottom (offset 64)
+      floatView[16] = noiseParams.gradientBottom;
+      // gradientTop (offset 68)
+      floatView[17] = noiseParams.gradientTop;
+      // warpStrength (offset 72)
+      floatView[18] = noiseParams.warpStrength;
+      // flipZ (offset 76)
+      floatView[19] = noiseParams.flipZ ? 1.0 : 0.0;
+      // zPadding (offset 80)
+      floatView[20] = noiseParams.zPadding;
+      // _pad1 (offset 84) - padding to 96 bytes
+      floatView[21] = 0.0;
+      floatView[22] = 0.0;
+      floatView[23] = 0.0;
+    }
 
     device.queue.writeBuffer(bakeUniformBuffer, 0, bakeUniformData);
 
@@ -1207,7 +1349,8 @@ async function init() {
 
     // Log timing (approximate, doesn't wait for GPU)
     const endTime = performance.now();
-    console.log(`[Bake] Dispatched SDF bake: ${resolution}³ voxels, ${sphereCount} spheres, ${workgroups}³ workgroups (~${(endTime - startTime).toFixed(1)}ms CPU time)`);
+    const noiseStr = bakeNoise ? ' + noise' : '';
+    console.log(`[Bake] Dispatched SDF bake${noiseStr}: ${resolution}³ voxels, ${sphereCount} spheres, ${workgroups}³ workgroups (~${(endTime - startTime).toFixed(1)}ms CPU time)`);
   }
 
   canvas.width = window.innerWidth * window.devicePixelRatio;
@@ -1277,6 +1420,7 @@ async function init() {
     // Performance
     sdfResolution: 128,
     sdfMode: 'Baked',  // 'Dynamic' or 'Baked'
+    bakeNoise: true,   // Bake noise into texture (static) or compute live (animated)
   };
 
   function regenerate() {
@@ -1327,9 +1471,10 @@ async function init() {
     }
     rebuildSpheres(data);
     console.log(`[${params.shape}] Generated ${sphereCount} spheres`);
-    // Bake SDF into texture
-    const smoothnessValue = params.blendMode === 'Smooth' ? params.smoothness : 0.0;
-    bakeSDFTexture(params.sdfResolution, smoothnessValue);
+    // Bake SDF into texture (triggerBake is defined later but hoisted)
+    if (typeof triggerBake === 'function') {
+      triggerBake();
+    }
   }
 
   const gui = new GUI();
@@ -1380,19 +1525,26 @@ async function init() {
   replicationFolder.add(params, 'scaleMult', 0.2, 0.9, 0.05).name('Scale Mult').onChange(regenerate);
   replicationFolder.add(params, 'seed', 1, 100, 1).name('Seed').onChange(regenerate);
 
+  // Helper to rebake when noise params change (if bakeNoise is enabled)
+  function onNoiseChange() {
+    if (params.bakeNoise && typeof triggerBake === 'function') {
+      triggerBake();
+    }
+  }
+
   const gradientFolder = gui.addFolder('Density Gradient');
-  gradientFolder.add(params, 'gradientBottom', -1.0, 1.0, 0.05).name('Bottom');
-  gradientFolder.add(params, 'gradientTop', -1.0, 1.0, 0.05).name('Top');
-  gradientFolder.add(params, 'gradientStrength', 0.0, 1.0, 0.01).name('Strength');
-  gradientFolder.add(params, 'zPadding', 0.0, 1.0, 0.01).name('Z Padding');
-  gradientFolder.add(params, 'flipZ').name('Flip Z');
+  gradientFolder.add(params, 'gradientBottom', -1.0, 1.0, 0.05).name('Bottom').onChange(onNoiseChange);
+  gradientFolder.add(params, 'gradientTop', -1.0, 1.0, 0.05).name('Top').onChange(onNoiseChange);
+  gradientFolder.add(params, 'gradientStrength', 0.0, 1.0, 0.01).name('Strength').onChange(onNoiseChange);
+  gradientFolder.add(params, 'zPadding', 0.0, 1.0, 0.01).name('Z Padding').onChange(onNoiseChange);
+  gradientFolder.add(params, 'flipZ').name('Flip Z').onChange(onNoiseChange);
 
   const noiseFolder = gui.addFolder('Noise');
-  noiseFolder.add(params, 'billowyScale', 0.5, 5.0, 0.1).name('Billowy Scale');
-  noiseFolder.add(params, 'billowyStrength', 0.0, 0.5, 0.01).name('Billowy Strength');
-  noiseFolder.add(params, 'wispyScale', 2.0, 20.0, 0.5).name('Wispy Scale');
-  noiseFolder.add(params, 'wispyStrength', 0.0, 0.3, 0.01).name('Wispy Strength');
-  noiseFolder.add(params, 'coverage', -0.5, 0.5, 0.01).name('Coverage');
+  noiseFolder.add(params, 'billowyScale', 0.5, 5.0, 0.1).name('Billowy Scale').onChange(onNoiseChange);
+  noiseFolder.add(params, 'billowyStrength', 0.0, 0.5, 0.01).name('Billowy Strength').onChange(onNoiseChange);
+  noiseFolder.add(params, 'wispyScale', 2.0, 20.0, 0.5).name('Wispy Scale').onChange(onNoiseChange);
+  noiseFolder.add(params, 'wispyStrength', 0.0, 0.3, 0.01).name('Wispy Strength').onChange(onNoiseChange);
+  noiseFolder.add(params, 'coverage', -0.5, 0.5, 0.01).name('Coverage').onChange(onNoiseChange);
 
   const lightingFolder = gui.addFolder('Lighting');
   lightingFolder.add(params, 'renderMode', ['Surface', 'Volume']).name('Render Mode');
@@ -1413,24 +1565,49 @@ async function init() {
 
   const animationFolder = gui.addFolder('Animation');
   animationFolder.add(params, 'timeScale', 0.0, 1.0, 0.01).name('Evolution Speed');
-  animationFolder.add(params, 'warpStrength', 0.0, 1.0, 0.01).name('Warp Strength');
+  animationFolder.add(params, 'warpStrength', 0.0, 1.0, 0.01).name('Warp Strength').onChange(onNoiseChange);
 
   gui.add(params, 'blendMode', ['Sharp', 'Smooth']).name('Blend Mode');
   gui.add(params, 'smoothness', 0.05, 1.0, 0.01).name('Smoothness');
 
   const performanceFolder = gui.addFolder('Performance');
   performanceFolder.add(params, 'sdfMode', ['Dynamic', 'Baked']).name('SDF Mode');
+  performanceFolder.add(params, 'bakeNoise').name('Bake Noise').onChange(() => {
+    // Re-bake with or without noise
+    triggerBake();
+  });
   performanceFolder.add(params, 'sdfResolution', [32, 64, 128, 256]).name('SDF Resolution').onChange((value) => {
     createSDFTexture(value);
-    // Re-bake with new resolution
-    const smoothnessValue = params.blendMode === 'Smooth' ? params.smoothness : 0.0;
-    bakeSDFTexture(value, smoothnessValue);
+    triggerBake();
   });
+
+  // Helper to get noise parameters for baking
+  function getNoiseParams() {
+    return {
+      billowyScale: params.billowyScale,
+      billowyStrength: params.billowyStrength,
+      wispyScale: params.wispyScale,
+      wispyStrength: params.wispyStrength,
+      coverage: params.coverage,
+      gradientStrength: params.gradientStrength,
+      gradientBottom: params.gradientBottom,
+      gradientTop: params.gradientTop,
+      warpStrength: params.warpStrength,
+      flipZ: params.flipZ,
+      zPadding: params.zPadding,
+    };
+  }
+
+  // Helper to trigger bake with current settings
+  function triggerBake() {
+    const smoothnessValue = params.blendMode === 'Smooth' ? params.smoothness : 0.0;
+    const noiseParams = params.bakeNoise ? getNoiseParams() : null;
+    bakeSDFTexture(params.sdfResolution, smoothnessValue, noiseParams);
+  }
 
   // Create initial SDF texture and bake
   createSDFTexture(params.sdfResolution);
-  const initialSmoothness = params.blendMode === 'Smooth' ? params.smoothness : 0.0;
-  bakeSDFTexture(params.sdfResolution, initialSmoothness);
+  triggerBake();
 
   // Orbit camera state
   let orbitTheta = Math.PI / 4;   // horizontal angle
@@ -1519,10 +1696,11 @@ async function init() {
     const cg = ((cc >> 8) & 0xff) / 255;
     const cb = (cc & 0xff) / 255;
     const sdfModeValue = params.sdfMode === 'Baked' ? 1.0 : 0.0;
+    const noiseBakedValue = (params.sdfMode === 'Baked' && params.bakeNoise) ? 1.0 : 0.0;
     device.queue.writeBuffer(volumeUniformBuffer, 240, new Float32Array([
       params.sunX, params.sunY, params.sunZ, params.ambient,
       cr, cg, cb, performance.now() / 1000,
-      params.timeScale, params.warpStrength, sdfModeValue, 0.0,
+      params.timeScale, params.warpStrength, sdfModeValue, noiseBakedValue,
     ]));
 
     const commandEncoder = device.createCommandEncoder();

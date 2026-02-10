@@ -957,6 +957,26 @@ async function init() {
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
+  // === 3D SDF Texture for baked SDF (Performance Optimization) ===
+  let sdfTexture = null;
+
+  function createSDFTexture(resolution) {
+    if (sdfTexture) {
+      sdfTexture.destroy();
+    }
+    sdfTexture = device.createTexture({
+      size: [resolution, resolution, resolution],
+      format: 'r32float',
+      dimension: '3d',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    const memoryMB = (resolution ** 3 * 4 / 1024 / 1024).toFixed(1);
+    console.log(`[SDF Texture] Created ${resolution}³ 3D texture (${memoryMB}MB)`);
+    return sdfTexture;
+  }
+
+  // Initial texture will be created after params are defined
+
   // Generate cloud spheres
   let sphereData = generateCumulus();
   let sphereCount = sphereData.length / 4;
@@ -1064,6 +1084,8 @@ async function init() {
     species: 'Mediocris',
     gridY: 4,
     windShear: 0.0,
+    // Performance
+    sdfResolution: 128,
   };
 
   function regenerate() {
@@ -1201,6 +1223,14 @@ async function init() {
 
   gui.add(params, 'blendMode', ['Sharp', 'Smooth']).name('Blend Mode');
   gui.add(params, 'smoothness', 0.05, 1.0, 0.01).name('Smoothness');
+
+  const performanceFolder = gui.addFolder('Performance');
+  performanceFolder.add(params, 'sdfResolution', [32, 64, 128, 256]).name('SDF Resolution').onChange((value) => {
+    createSDFTexture(value);
+  });
+
+  // Create initial SDF texture
+  createSDFTexture(params.sdfResolution);
 
   // Orbit camera state
   let orbitTheta = Math.PI / 4;   // horizontal angle

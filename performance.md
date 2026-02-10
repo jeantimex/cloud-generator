@@ -47,7 +47,7 @@ After:   cloudSDF(p) → textureSample(sdfTexture, p) → return distance
 | SDF lookup cost | O(sphereCount) | O(1) |
 | Sphere loop | Every frame, every sample | Once per regeneration |
 | Hardware acceleration | None | Trilinear filtering |
-| Memory | ~5KB (sphere buffer) | ~8MB (128³ texture) |
+| Memory | ~5KB (sphere buffer) | ~16MB (128³ texture, rgba16float) |
 
 ### Tradeoffs
 - **Memory usage**: 128³ × 4 bytes = 8MB (acceptable)
@@ -178,15 +178,15 @@ After:   cloudSDF(p) → textureSample(sdfTexture, p) → return distance
 ### Phase 1: 3D Texture Infrastructure
 - [x] Create 3D texture resource
 - [x] Create trilinear sampler
-- [ ] Update bind group layout
-- [ ] Implement coordinate mapping function
+- [x] Update bind group layout (add texture + sampler to shader and bind group)
+- [x] Implement coordinate mapping function
 
 ### Phase 2: Compute Shader
-- [ ] Write compute shader WGSL
-- [ ] Create compute pipeline
-- [ ] Create compute bind group
-- [ ] Dispatch on regeneration
-- [ ] Add profiling/logging
+- [x] Write compute shader WGSL
+- [x] Create compute pipeline
+- [x] Create compute bind group
+- [x] Dispatch on regeneration
+- [x] Add profiling/logging
 
 ### Phase 3: Fragment Shader Integration
 - [ ] Add sdfMode uniform

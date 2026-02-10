@@ -431,6 +431,64 @@ fn fs_main() -> @location(0) vec4<f32> {
 }
 `;
 
+// === Compute Shader for SDF Baking ===
+const sdfBakeShaderCode = `
+struct BakeUniforms {
+  boxMin : vec3<f32>,
+  sphereCount : u32,
+  boxMax : vec3<f32>,
+  smoothness : f32,
+  resolution : u32,
+  _pad1 : u32,
+  _pad2 : u32,
+  _pad3 : u32,
+};
+
+@binding(0) @group(0) var<uniform> bakeUniforms : BakeUniforms;
+@binding(1) @group(0) var<storage, read> spheres : array<vec4<f32>>;
+@binding(2) @group(0) var sdfTextureWrite : texture_storage_3d<rgba16float, write>;
+
+fn sphereSDF(p : vec3<f32>, center : vec3<f32>, radius : f32) -> f32 {
+  return length(p - center) - radius;
+}
+
+fn smin(a : f32, b : f32, k : f32) -> f32 {
+  let h = max(k - abs(a - b), 0.0) / k;
+  return min(a, b) - h * h * k * 0.25;
+}
+
+@compute @workgroup_size(4, 4, 4)
+fn bakeSDF(@builtin(global_invocation_id) id : vec3<u32>) {
+  let res = bakeUniforms.resolution;
+
+  // Skip if outside texture bounds
+  if (id.x >= res || id.y >= res || id.z >= res) {
+    return;
+  }
+
+  // Convert voxel coordinate to world position
+  let uvw = (vec3<f32>(id) + 0.5) / f32(res);
+  let worldPos = mix(bakeUniforms.boxMin, bakeUniforms.boxMax, uvw);
+
+  // Compute SDF: smooth union of all spheres
+  var d = 1e10;
+  let k = bakeUniforms.smoothness;
+
+  for (var i = 0u; i < bakeUniforms.sphereCount; i++) {
+    let s = spheres[i];
+    let sd = sphereSDF(worldPos, s.xyz, s.w);
+    if (k > 0.0) {
+      d = smin(d, sd, k);
+    } else {
+      d = min(d, sd);
+    }
+  }
+
+  // Write SDF value to texture (store in .r channel)
+  textureStore(sdfTextureWrite, id, vec4(d, 0.0, 0.0, 1.0));
+}
+`;
+
 const volumeShaderCode = `
 struct VolumeUniforms {
   viewProjection : mat4x4<f32>,
@@ -469,6 +527,14 @@ struct VolumeUniforms {
 
 @binding(0) @group(0) var<uniform> volumeUniforms : VolumeUniforms;
 @binding(1) @group(0) var<storage, read> spheres : array<vec4<f32>>;
+@binding(2) @group(0) var sdfTexture : texture_3d<f32>;
+@binding(3) @group(0) var sdfSampler : sampler;
+
+// Helper: sample baked SDF texture (will be used in Phase 3)
+fn sampleBakedSDF(p : vec3<f32>) -> f32 {
+  let uvw = (p - volumeUniforms.boxMin) / (volumeUniforms.boxMax - volumeUniforms.boxMin);
+  return textureSample(sdfTexture, sdfSampler, uvw).r;
+}
 
 struct VertexOutput {
   @builtin(position) Position : vec4<f32>,
@@ -654,6 +720,9 @@ fn lightMarch(pos : vec3<f32>, lightDir : vec3<f32>, absorption : f32) -> f32 {
 
 @fragment
 fn fs_volume(@location(0) worldPos : vec3<f32>) -> @location(0) vec4<f32> {
+  // Dummy read to ensure texture binding is included (will be used in Phase 3)
+  let _dummy = sampleBakedSDF(vec3(0.0)) * 0.0;
+
   let rayOrigin = volumeUniforms.cameraPosition;
   let rayDir = normalize(worldPos - rayOrigin);
 
@@ -966,12 +1035,19 @@ async function init() {
     }
     sdfTexture = device.createTexture({
       size: [resolution, resolution, resolution],
-      format: 'r32float',
+      format: 'rgba16float',  // rgba16float supports both storage binding AND filtering
       dimension: '3d',
       usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
     });
-    const memoryMB = (resolution ** 3 * 4 / 1024 / 1024).toFixed(1);
+    const memoryMB = (resolution ** 3 * 8 / 1024 / 1024).toFixed(1);  // rgba16float = 8 bytes
     console.log(`[SDF Texture] Created ${resolution}³ 3D texture (${memoryMB}MB)`);
+    // Rebuild bind groups with new texture
+    if (typeof rebuildVolumeBindGroup === 'function') {
+      rebuildVolumeBindGroup();
+    }
+    if (typeof rebuildBakeBindGroup === 'function') {
+      rebuildBakeBindGroup();
+    }
     return sdfTexture;
   }
 
@@ -988,6 +1064,27 @@ async function init() {
   });
   console.log('[SDF Sampler] Created trilinear sampler');
 
+  // === Compute Pipeline for SDF Baking ===
+  const sdfBakeShaderModule = device.createShaderModule({
+    code: sdfBakeShaderCode,
+  });
+
+  const sdfBakePipeline = device.createComputePipeline({
+    layout: 'auto',
+    compute: {
+      module: sdfBakeShaderModule,
+      entryPoint: 'bakeSDF',
+    },
+  });
+
+  // Uniform buffer for bake compute shader (BakeUniforms struct: 48 bytes)
+  const bakeUniformBuffer = device.createBuffer({
+    size: 48,  // boxMin(12) + sphereCount(4) + boxMax(12) + smoothness(4) + resolution(4) + padding(12) = 48 bytes
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  console.log('[Compute Pipeline] SDF bake pipeline created');
+
   // Generate cloud spheres
   let sphereData = generateCumulus();
   let sphereCount = sphereData.length / 4;
@@ -1003,13 +1100,41 @@ async function init() {
   });
   device.queue.writeBuffer(sphereBuffer, 0, sphereData);
 
-  let volumeBindGroup = device.createBindGroup({
-    layout: volumePipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: volumeUniformBuffer } },
-      { binding: 1, resource: { buffer: sphereBuffer } },
-    ],
-  });
+  let volumeBindGroup = null;
+  let sdfBakeBindGroup = null;
+
+  function rebuildVolumeBindGroup() {
+    if (!sdfTexture) {
+      console.warn('[BindGroup] SDF texture not ready, skipping bind group creation');
+      return;
+    }
+    volumeBindGroup = device.createBindGroup({
+      layout: volumePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: volumeUniformBuffer } },
+        { binding: 1, resource: { buffer: sphereBuffer } },
+        { binding: 2, resource: sdfTexture.createView() },
+        { binding: 3, resource: sdfSampler },
+      ],
+    });
+    console.log('[BindGroup] Volume bind group created with SDF texture and sampler');
+  }
+
+  function rebuildBakeBindGroup() {
+    if (!sdfTexture) {
+      console.warn('[BindGroup] SDF texture not ready, skipping bake bind group creation');
+      return;
+    }
+    sdfBakeBindGroup = device.createBindGroup({
+      layout: sdfBakePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: bakeUniformBuffer } },
+        { binding: 1, resource: { buffer: sphereBuffer } },
+        { binding: 2, resource: sdfTexture.createView() },
+      ],
+    });
+    console.log('[BindGroup] SDF bake bind group created');
+  }
 
   function rebuildSpheres(data) {
     sphereBuffer.destroy();
@@ -1022,13 +1147,60 @@ async function init() {
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
     device.queue.writeBuffer(sphereBuffer, 0, data);
-    volumeBindGroup = device.createBindGroup({
-      layout: volumePipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: volumeUniformBuffer } },
-        { binding: 1, resource: { buffer: sphereBuffer } },
-      ],
-    });
+    rebuildVolumeBindGroup();
+    rebuildBakeBindGroup();
+  }
+
+  // Function to dispatch the SDF bake compute shader
+  function bakeSDFTexture(resolution, smoothness) {
+    if (!sdfBakeBindGroup || !sdfTexture) {
+      console.warn('[Bake] Bind group or texture not ready, skipping bake');
+      return;
+    }
+
+    const startTime = performance.now();
+
+    // Update bake uniforms (48 bytes total):
+    // boxMin(vec3, 12) + sphereCount(u32, 4) + boxMax(vec3, 12) + smoothness(f32, 4) + resolution(u32, 4) + padding(12)
+    const bakeUniformData = new ArrayBuffer(48);
+    const floatView = new Float32Array(bakeUniformData);
+    const uintView = new Uint32Array(bakeUniformData);
+
+    // boxMin (offset 0, 12 bytes)
+    floatView[0] = cloudBounds.min[0];
+    floatView[1] = cloudBounds.min[1];
+    floatView[2] = cloudBounds.min[2];
+    // sphereCount (offset 12, 4 bytes)
+    uintView[3] = sphereCount;
+    // boxMax (offset 16, 12 bytes)
+    floatView[4] = cloudBounds.max[0];
+    floatView[5] = cloudBounds.max[1];
+    floatView[6] = cloudBounds.max[2];
+    // smoothness (offset 28, 4 bytes)
+    floatView[7] = smoothness;
+    // resolution (offset 32, 4 bytes)
+    uintView[8] = resolution;
+    // padding at offset 36-47 (automatically zero)
+
+    device.queue.writeBuffer(bakeUniformBuffer, 0, bakeUniformData);
+
+    // Create command encoder and dispatch compute shader
+    const commandEncoder = device.createCommandEncoder();
+    const computePass = commandEncoder.beginComputePass();
+
+    computePass.setPipeline(sdfBakePipeline);
+    computePass.setBindGroup(0, sdfBakeBindGroup);
+
+    // Dispatch workgroups: ceil(resolution / 4) in each dimension (workgroup size is 4×4×4)
+    const workgroups = Math.ceil(resolution / 4);
+    computePass.dispatchWorkgroups(workgroups, workgroups, workgroups);
+
+    computePass.end();
+    device.queue.submit([commandEncoder.finish()]);
+
+    // Log timing (approximate, doesn't wait for GPU)
+    const endTime = performance.now();
+    console.log(`[Bake] Dispatched SDF bake: ${resolution}³ voxels, ${sphereCount} spheres, ${workgroups}³ workgroups (~${(endTime - startTime).toFixed(1)}ms CPU time)`);
   }
 
   canvas.width = window.innerWidth * window.devicePixelRatio;
@@ -1147,6 +1319,9 @@ async function init() {
     }
     rebuildSpheres(data);
     console.log(`[${params.shape}] Generated ${sphereCount} spheres`);
+    // Bake SDF into texture
+    const smoothnessValue = params.blendMode === 'Smooth' ? params.smoothness : 0.0;
+    bakeSDFTexture(params.sdfResolution, smoothnessValue);
   }
 
   const gui = new GUI();
@@ -1238,10 +1413,15 @@ async function init() {
   const performanceFolder = gui.addFolder('Performance');
   performanceFolder.add(params, 'sdfResolution', [32, 64, 128, 256]).name('SDF Resolution').onChange((value) => {
     createSDFTexture(value);
+    // Re-bake with new resolution
+    const smoothnessValue = params.blendMode === 'Smooth' ? params.smoothness : 0.0;
+    bakeSDFTexture(value, smoothnessValue);
   });
 
-  // Create initial SDF texture
+  // Create initial SDF texture and bake
   createSDFTexture(params.sdfResolution);
+  const initialSmoothness = params.blendMode === 'Smooth' ? params.smoothness : 0.0;
+  bakeSDFTexture(params.sdfResolution, initialSmoothness);
 
   // Orbit camera state
   let orbitTheta = Math.PI / 4;   // horizontal angle
@@ -1371,11 +1551,13 @@ async function init() {
     passEncoder.drawIndexed(indices.length);
 
     // Draw Volume (raymarched fog inside the cube)
-    passEncoder.setPipeline(volumePipeline);
-    passEncoder.setVertexBuffer(0, vertexBuffer);
-    passEncoder.setIndexBuffer(solidIndexBuffer, 'uint16');
-    passEncoder.setBindGroup(0, volumeBindGroup);
-    passEncoder.drawIndexed(solidIndices.length);
+    if (volumeBindGroup) {
+      passEncoder.setPipeline(volumePipeline);
+      passEncoder.setVertexBuffer(0, vertexBuffer);
+      passEncoder.setIndexBuffer(solidIndexBuffer, 'uint16');
+      passEncoder.setBindGroup(0, volumeBindGroup);
+      passEncoder.drawIndexed(solidIndices.length);
+    }
 
     passEncoder.end();
 

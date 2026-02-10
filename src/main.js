@@ -180,10 +180,13 @@ function generateFromCurve(options = {}) {
       [-0.8, 0, 0], [-0.4, 0.2, 0.3], [0, -0.1, -0.2], [0.4, 0.3, 0.4], [0.8, 0, 0]
     ];
   } else if (curveType === 'Spiral') {
-    for (let i = 0; i < 6; i++) {
-      const a = i * 1.5;
-      const r = i * 0.15;
-      controlPoints.push([Math.cos(a) * r, i * 0.2 - 0.5, Math.sin(a) * r]);
+    const turns = 2.5;
+    const points = 12;
+    for (let i = 0; i < points; i++) {
+      const t = i / (points - 1);
+      const angle = t * Math.PI * 2 * turns;
+      const radius = t * 0.8;
+      controlPoints.push([Math.cos(angle) * radius, (rng() - 0.5) * 0.1, Math.sin(angle) * radius]);
     }
   } else if (curveType === 'Circle') {
     for (let i = 0; i < 8; i++) {

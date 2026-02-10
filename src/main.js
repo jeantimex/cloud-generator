@@ -709,6 +709,7 @@ struct VolumeUniforms {
   warpStrength : f32,
   sdfMode : f32,     // 0.0 = dynamic (loop spheres), 1.0 = baked (sample texture)
   noiseBaked : f32,  // 0.0 = compute noise live, 1.0 = noise is baked in texture
+  normalEpsilon : f32,
 };
 
 @binding(0) @group(0) var<uniform> volumeUniforms : VolumeUniforms;
@@ -915,7 +916,7 @@ fn sampleDensity(p : vec3<f32>) -> f32 {
 }
 
 fn calcNormal(p : vec3<f32>) -> vec3<f32> {
-  let e = 0.001;
+  let e = volumeUniforms.normalEpsilon;
   let n = vec3(
     cloudSDF(p + vec3(e, 0.0, 0.0)) - cloudSDF(p - vec3(e, 0.0, 0.0)),
     cloudSDF(p + vec3(0.0, e, 0.0)) - cloudSDF(p - vec3(0.0, e, 0.0)),
@@ -1248,9 +1249,9 @@ async function init() {
     },
   });
 
-  // Volume uniform buffer: 288 bytes (see VolumeUniforms struct)
+  // Volume uniform buffer: 304 bytes (see VolumeUniforms struct, padded to 16-byte alignment)
   const volumeUniformBuffer = device.createBuffer({
-    size: 288,
+    size: 304,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
@@ -1617,6 +1618,7 @@ async function init() {
     sdfResolution: 128,
     sdfMode: 'Baked',  // 'Dynamic' or 'Baked'
     bakeNoise: true,   // Bake noise into texture (static) or compute live (animated)
+    normalEpsilon: 0.01,  // Epsilon for normal calculation (larger = smoother)
   };
 
   function regenerate() {
@@ -1776,6 +1778,7 @@ async function init() {
     createSDFTexture(value);
     triggerBake();
   });
+  performanceFolder.add(params, 'normalEpsilon', 0.001, 0.05, 0.001).name('Normal Epsilon');
 
   // Helper to get noise parameters for baking
   function getNoiseParams() {
@@ -1898,6 +1901,7 @@ async function init() {
       params.sunX, params.sunY, params.sunZ, params.ambient,
       cr, cg, cb, performance.now() / 1000,
       params.timeScale, params.warpStrength, sdfModeValue, noiseBakedValue,
+      params.normalEpsilon,
     ]));
 
     const commandEncoder = device.createCommandEncoder();

@@ -1,5 +1,11 @@
 import { mat4 } from 'gl-matrix';
 import GUI from 'lil-gui';
+import Stats from 'stats.js/src/Stats.js';
+
+// Stats setup
+const stats = new Stats();
+stats.showPanel(0); // 0: fps, 1: ms, 2: mb, 3+: custom
+document.body.appendChild(stats.dom);
 
 // Seeded PRNG (mulberry32)
 function createRNG(seed) {
@@ -1024,17 +1030,17 @@ async function init() {
     gradientBottom: -0.2,
     gradientTop: 0.5,
     gradientStrength: 0.0,
-    billowyScale: 3.0,
-    billowyStrength: 0.2,
-    wispyScale: 9.5,
-    wispyStrength: 0.12,
+    billowyScale: 0.0,
+    billowyStrength: 0.0,
+    wispyScale: 0.0,
+    wispyStrength: 0.0,
     coverage: 0.0,
     zPadding: 0.0,
     flipZ: false,
     absorption: 5.0,
     renderSteps: 64,
     lightSteps: 6,
-    renderMode: 'Volume',
+    renderMode: 'Surface',
     anisotropy1: 0.5,
     anisotropy2: -0.3,
     phaseBlend: 0.5,
@@ -1046,7 +1052,7 @@ async function init() {
     cloudScale: 1.0,
     blendMode: 'Sharp',
     smoothness: 0.3,
-    timeScale: 0.2,
+    timeScale: 0.0,
     warpStrength: 0.15,
     meshResolution: 15,
     customMesh: null,
@@ -1229,6 +1235,7 @@ async function init() {
   }, { passive: false });
 
   function render() {
+    stats.begin();
     const aspect = canvas.clientWidth / canvas.clientHeight;
     mat4.perspective(projectionMatrix, (2 * Math.PI) / 5, aspect, 0.1, 100.0);
 
@@ -1333,6 +1340,7 @@ async function init() {
 
     device.queue.submit([commandEncoder.finish()]);
 
+    stats.end();
     requestAnimationFrame(render);
   }
 

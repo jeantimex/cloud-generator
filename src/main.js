@@ -377,6 +377,65 @@ function generateEllipsoid(options = {}) {
   });
 }
 
+function generateSkybox(options = {}) {
+  const {
+    seed = 42,
+    skyboxWidth = 4.0,      // Width of cloud layer (X)
+    skyboxDepth = 4.0,      // Depth of cloud layer (Z)
+    skyboxHeight = 0.8,     // Thickness of cloud layer (Y)
+    skyboxDensity = 0.5,    // 0-1, controls how many clouds
+    skyboxCloudSize = 0.15, // Base size of individual cloud puffs
+    skyboxSizeVariation = 0.5, // How much cloud sizes vary
+    replicationIterations = 1,
+    childrenPerSphere = 3,
+    keepProbability = 0.5,
+    scaleMult = 0.5,
+  } = options;
+
+  const rng = createRNG(seed);
+  const spheres = [];
+
+  // Grid spacing based on cloud size
+  const gridSpacing = skyboxCloudSize * 3;
+  const gridX = Math.ceil(skyboxWidth / gridSpacing);
+  const gridZ = Math.ceil(skyboxDepth / gridSpacing);
+
+  // For each grid cell, potentially place a cloud cluster
+  for (let ix = 0; ix < gridX; ix++) {
+    for (let iz = 0; iz < gridZ; iz++) {
+      // Skip based on density
+      if (rng() > skyboxDensity) continue;
+
+      // Base position with jitter
+      const baseX = (ix / gridX - 0.5) * skyboxWidth + (rng() - 0.5) * gridSpacing * 0.8;
+      const baseZ = (iz / gridZ - 0.5) * skyboxDepth + (rng() - 0.5) * gridSpacing * 0.8;
+      const baseY = (rng() - 0.5) * skyboxHeight * 0.5;
+
+      // Create a small cloud cluster at this position
+      const clusterSize = 1 + Math.floor(rng() * 4); // 1-4 spheres per cluster
+      const clusterScale = 0.7 + rng() * skyboxSizeVariation;
+
+      for (let c = 0; c < clusterSize; c++) {
+        const offsetX = (rng() - 0.5) * skyboxCloudSize * 2;
+        const offsetY = (rng() - 0.5) * skyboxCloudSize * 1.5;
+        const offsetZ = (rng() - 0.5) * skyboxCloudSize * 2;
+        const radius = skyboxCloudSize * clusterScale * (0.5 + rng() * 0.5);
+
+        spheres.push(
+          baseX + offsetX,
+          baseY + offsetY,
+          baseZ + offsetZ,
+          radius
+        );
+      }
+    }
+  }
+
+  return replicateSpheres(spheres, rng, {
+    replicationIterations, childrenPerSphere, keepProbability, scaleMult,
+  });
+}
+
 function computeBounds(sphereData, padding = 0.15) {
   let minX = Infinity, minY = Infinity, minZ = Infinity;
   let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
@@ -1903,6 +1962,13 @@ async function init() {
     species: 'Mediocris',
     gridY: 4,
     windShear: 0.0,
+    // Skybox settings
+    skyboxWidth: 4.0,
+    skyboxDepth: 4.0,
+    skyboxHeight: 0.8,
+    skyboxDensity: 0.5,
+    skyboxCloudSize: 0.15,
+    skyboxSizeVariation: 0.5,
     // Performance
     sdfResolution: 128,
     sdfMode: 'Baked',  // 'Dynamic' or 'Baked'
@@ -1947,6 +2013,16 @@ async function init() {
       });
     } else if (params.shape === 'Ellipsoid') {
       data = generateEllipsoid(repOpts);
+    } else if (params.shape === 'Skybox') {
+      data = generateSkybox({
+        skyboxWidth: params.skyboxWidth,
+        skyboxDepth: params.skyboxDepth,
+        skyboxHeight: params.skyboxHeight,
+        skyboxDensity: params.skyboxDensity,
+        skyboxCloudSize: params.skyboxCloudSize,
+        skyboxSizeVariation: params.skyboxSizeVariation,
+        ...repOpts,
+      });
     } else if (params.shape === 'Custom Mesh' && params.customMesh) {
       data = voxelizeMesh(params.customMesh.vertices, params.customMesh.indices, {
         resolution: params.meshResolution,
@@ -1972,7 +2048,7 @@ async function init() {
   }
 
   const gui = new GUI();
-  gui.add(params, 'shape', ['Cumulus', 'Wispy', 'Ellipsoid', 'Custom Mesh']).name('Shape').onChange(regenerate);
+  gui.add(params, 'shape', ['Cumulus', 'Wispy', 'Ellipsoid', 'Skybox', 'Custom Mesh']).name('Shape').onChange(regenerate);
 
   const meshFolder = gui.addFolder('Mesh Settings');
   meshFolder.add(params, 'meshResolution', 5, 30, 1).name('Voxel Res');
@@ -2011,6 +2087,14 @@ async function init() {
   curveFolder.add(params, 'curvePoints', 5, 100, 1).name('Segments').onChange(regenerate);
   curveFolder.add(params, 'curveThickness', 0.05, 0.5, 0.01).name('Thickness').onChange(regenerate);
   curveFolder.add(params, 'curveBackboneNoise', 0.0, 0.5, 0.01).name('Backbone Noise').onChange(regenerate);
+
+  const skyboxFolder = gui.addFolder('Skybox Settings');
+  skyboxFolder.add(params, 'skyboxWidth', 1.0, 10.0, 0.5).name('Width').onChange(regenerate);
+  skyboxFolder.add(params, 'skyboxDepth', 1.0, 10.0, 0.5).name('Depth').onChange(regenerate);
+  skyboxFolder.add(params, 'skyboxHeight', 0.2, 2.0, 0.1).name('Height').onChange(regenerate);
+  skyboxFolder.add(params, 'skyboxDensity', 0.1, 1.0, 0.05).name('Density').onChange(regenerate);
+  skyboxFolder.add(params, 'skyboxCloudSize', 0.05, 0.5, 0.01).name('Cloud Size').onChange(regenerate);
+  skyboxFolder.add(params, 'skyboxSizeVariation', 0.0, 1.0, 0.05).name('Size Variation').onChange(regenerate);
 
   const replicationFolder = gui.addFolder('Replication');
   replicationFolder.add(params, 'iterations', 0, 4, 1).name('Iterations').onChange(regenerate);

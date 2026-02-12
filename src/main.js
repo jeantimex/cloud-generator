@@ -761,7 +761,7 @@ fn sampleSDF(p : vec3<f32>) -> f32 {
 // Convert SDF to density
 fn sampleDensity(p : vec3<f32>) -> f32 {
   let dist = sampleSDF(p);
-  return smoothstep(0.1, -0.1, dist);
+  return smoothstep(0.2, -0.2, dist);
 }
 
 // Fibonacci sphere distribution for stratified sampling (full sphere)
@@ -1117,7 +1117,7 @@ fn cloudSDF(p : vec3<f32>) -> f32 {
 
 fn sampleDensity(p : vec3<f32>) -> f32 {
   let dist = cloudSDF(p);
-  return smoothstep(0.1, -0.1, dist);
+  return smoothstep(0.2, -0.2, dist);
 }
 
 fn calcNormal(p : vec3<f32>) -> vec3<f32> {
@@ -1142,21 +1142,28 @@ fn dualPhase(cosTheta : f32) -> f32 {
   return mix(hg1, hg2, volumeUniforms.phaseBlend);
 }
 
-fn lightMarch(pos : vec3<f32>, lightDir : vec3<f32>, absorption : f32) -> f32 {
+fn lightMarch(pos : vec3<f32>, lightDir : vec3<f32>, absorption : f32, jitter : f32) -> f32 {
   // March toward the light to estimate how much cloud is in the way
   let numSteps = i32(volumeUniforms.lightSteps);
   let stepSize = 0.12;
   var totalDensity = 0.0;
   for (var i = 1; i <= numSteps; i++) {
-    let samplePos = pos + lightDir * f32(i) * stepSize;
+    // Jitter the shadow samples to break up shadow banding
+    let samplePos = pos + lightDir * (f32(i) + jitter) * stepSize;
     totalDensity += sampleDensity(samplePos);
   }
   // Beer's Law: how much light reaches this point
   return exp(-totalDensity * stepSize * absorption);
 }
 
+fn interleavedGradientNoise(fragCoord : vec2<f32>) -> f32 {
+  let v = vec3(0.06711056, 0.00583715, 52.9829189);
+  return fract(v.z * fract(dot(fragCoord, v.xy)));
+}
+
 @fragment
-fn fs_volume(@location(0) worldPos : vec3<f32>) -> @location(0) vec4<f32> {
+fn fs_volume(in : VertexOutput) -> @location(0) vec4<f32> {
+  let worldPos = in.worldPos;
   let rayOrigin = volumeUniforms.cameraPosition;
   let rayDir = normalize(worldPos - rayOrigin);
 
@@ -1207,7 +1214,9 @@ fn fs_volume(@location(0) worldPos : vec3<f32>) -> @location(0) vec4<f32> {
   var accColor = vec3(0.0);
   let cloudColor = volumeUniforms.cloudColor;
 
-  var tCurrent = tNear;
+  // Jitter the starting position to break up banding
+  let jitter = interleavedGradientNoise(in.Position.xy);
+  var tCurrent = tNear + jitter * denseStepSize;
   for (var i = 0; i < maxSteps; i++) {
     if (tCurrent > tFar || transmittance < 0.01) { break; }
 
@@ -1215,16 +1224,17 @@ fn fs_volume(@location(0) worldPos : vec3<f32>) -> @location(0) vec4<f32> {
     let sdfDist = cloudSDF(pos);
 
     // If far from surface, skip ahead using SDF distance
-    if (sdfDist > denseStepSize * 2.0) {
-      tCurrent += sdfDist * 0.8;
+    // Only skip if we are well outside the cloud's density range (sdfDist > 0.2)
+    if (sdfDist > 0.2) {
+      tCurrent += max(sdfDist - 0.18, denseStepSize);
       continue;
     }
 
     // Inside or near cloud: sample density and accumulate
-    let density = smoothstep(0.1, -0.1, sdfDist);
+    let density = smoothstep(0.2, -0.2, sdfDist);
     if (density > 0.001) {
-      let attenuation = exp(-density * denseStepSize * absorption);
-      let lightTransmittance = lightMarch(pos, lightDir, absorption);
+      let stepTransmittance = exp(-density * denseStepSize * absorption);
+      let lightTransmittance = lightMarch(pos, lightDir, absorption, jitter);
 
       // Henyey-Greenstein phase function for anisotropic scattering
       let cosTheta = dot(rayDir, lightDir);
@@ -1248,8 +1258,9 @@ fn fs_volume(@location(0) worldPos : vec3<f32>) -> @location(0) vec4<f32> {
       let luminance = ambient + directional + phaseBoost;
       let shade = luminance * cloudColor;
 
-      accColor += shade * density * denseStepSize * absorption * transmittance;
-      transmittance *= attenuation;
+      // Mathematically correct integration for a volume step
+      accColor += shade * (1.0 - stepTransmittance) * transmittance;
+      transmittance *= stepTransmittance;
     }
 
     tCurrent += denseStepSize;

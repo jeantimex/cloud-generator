@@ -598,6 +598,13 @@ struct BakeUniforms {
 @binding(0) @group(0) var<uniform> bakeUniforms : BakeUniforms;
 @binding(1) @group(0) var<storage, read> spheres : array<vec4<f32>>;
 @binding(2) @group(0) var sdfTextureWrite : texture_storage_3d<rgba16float, write>;
+@binding(3) @group(0) var noiseTexture : texture_3d<f32>;
+@binding(4) @group(0) var noiseSampler : sampler;
+
+fn sampleNoise3D(p : vec3<f32>, scale : f32, timeOffset : vec3<f32>) -> vec4<f32> {
+  let uvw = fract((p * scale + timeOffset) / 8.0);
+  return textureSampleLevel(noiseTexture, noiseSampler, uvw, 0.0);
+}
 
 fn sphereSDF(p : vec3<f32>, center : vec3<f32>, radius : f32) -> f32 {
   return length(p - center) - radius;
@@ -680,14 +687,13 @@ fn bakeSDF(@builtin(global_invocation_id) id : vec3<u32>) {
   if (bakeUniforms.bakeNoise > 0u) {
     let p = worldPos;
 
-    // Domain warping
+    // Domain warping (matching volume shader)
     var warpPos = p;
     let warpStr = bakeUniforms.warpStrength;
     if (warpStr > 0.0) {
-      let warpX = fbm3D_bake(p * 1.5, 3);
-      let warpY = fbm3D_bake(p * 1.5 + vec3(100.0, 0.0, 0.0), 3);
-      let warpZ = fbm3D_bake(p * 1.5 + vec3(0.0, 100.0, 0.0), 3);
-      warpPos += vec3(warpX, warpY, warpZ) * warpStr;
+      let noiseVal = sampleNoise3D(p, 1.5, vec3(0.0));
+      let noiseValZ = sampleNoise3D(p + vec3(50.0, 0.0, 0.0), 1.5, vec3(0.0));
+      warpPos += vec3(noiseVal.b, noiseVal.a, noiseValZ.b) * warpStr;
     }
 
     // Density gradient
@@ -700,18 +706,18 @@ fn bakeSDF(@builtin(global_invocation_id) id : vec3<u32>) {
       d += heightFrac * gStrength;
     }
 
-    // Billowy noise
+    // Billowy noise (matching volume shader)
     let billowyStr = bakeUniforms.billowyStrength;
     if (billowyStr > 0.0) {
-      let bn = fbm3D_bake(warpPos * bakeUniforms.billowyScale, 4);
-      d += bn * billowyStr;
+      let noiseVal = sampleNoise3D(warpPos, bakeUniforms.billowyScale, vec3(0.0));
+      d += noiseVal.r * billowyStr;
     }
 
-    // Wispy noise
+    // Wispy noise (matching volume shader)
     let wispyStr = bakeUniforms.wispyStrength;
     if (wispyStr > 0.0) {
-      let wn = fbm3D_bake(warpPos * bakeUniforms.wispyScale, 3);
-      d += wn * wispyStr;
+      let noiseVal = sampleNoise3D(warpPos, bakeUniforms.wispyScale, vec3(0.0));
+      d += noiseVal.g * wispyStr;
     }
 
     // Coverage
@@ -1730,6 +1736,8 @@ async function init() {
         { binding: 0, resource: { buffer: bakeUniformBuffer } },
         { binding: 1, resource: { buffer: sphereBuffer } },
         { binding: 2, resource: sdfTexture.createView() },
+        { binding: 3, resource: noiseTexture.createView() },
+        { binding: 4, resource: noiseSampler },
       ],
     });
     console.log('[BindGroup] SDF bake bind group created');
@@ -1920,6 +1928,8 @@ async function init() {
 
   const viewProjectionMatrix = mat4.create();
   const inverseViewProjectionMatrix = mat4.create();
+  let lastTime = performance.now();
+  let accumulatedTime = 0;
 
   const projectionMatrix = mat4.create();
   const viewMatrix = mat4.create();
@@ -2114,9 +2124,11 @@ async function init() {
   replicationFolder.add(params, 'scaleMult', 0.2, 0.9, 0.05).name('Scale Mult').onChange(regenerate);
   replicationFolder.add(params, 'seed', 1, 100, 1).name('Seed').onChange(regenerate);
 
-  // Helper to rebake when noise params change (if bakeNoise is enabled)
+  // Helper to rebake when noise params change
   function onNoiseChange() {
-    if (params.bakeNoise && typeof triggerBake === 'function') {
+    // Only rebake the SDF if we are in static mode (timeScale == 0) and bakeNoise is on.
+    // If animating, the noise is dynamic and updates via uniforms every frame.
+    if (params.bakeNoise && params.timeScale === 0 && typeof triggerBake === 'function') {
       triggerBake();
     }
   }
@@ -2152,8 +2164,15 @@ async function init() {
   appearanceFolder.add(params, 'ambient', 0.0, 1.0, 0.01).name('Ambient');
   appearanceFolder.add(params, 'cloudScale', 0.2, 3.0, 0.05).name('Cloud Scale').onChange(regenerate);
 
+  let lastTimeScale = params.timeScale;
   const animationFolder = gui.addFolder('Animation');
-  animationFolder.add(params, 'timeScale', 0.0, 1.0, 0.01).name('Evolution Speed');
+  animationFolder.add(params, 'timeScale', 0.0, 1.0, 0.01).name('Evolution Speed').onChange((val) => {
+    // If we transition between static (baked noise) and animated (dynamic noise), we must rebake the SDF
+    if (params.bakeNoise && ((val > 0 && lastTimeScale === 0) || (val === 0 && lastTimeScale > 0))) {
+      triggerBake();
+    }
+    lastTimeScale = val;
+  });
   animationFolder.add(params, 'warpStrength', 0.0, 1.0, 0.01).name('Warp Strength').onChange(onNoiseChange);
 
   gui.add(params, 'blendMode', ['Sharp', 'Smooth']).name('Blend Mode').onChange(triggerBake);
@@ -2199,7 +2218,9 @@ async function init() {
   // Helper to trigger bake with current settings
   function triggerBake() {
     const smoothnessValue = params.blendMode === 'Smooth' ? params.smoothness : 0.0;
-    const noiseParams = params.bakeNoise ? getNoiseParams() : null;
+    // If we are animating (timeScale > 0), we DON'T bake noise into the SDF texture
+    // even if bakeNoise is true, because we need the noise to be dynamic in the shader.
+    const noiseParams = (params.bakeNoise && params.timeScale === 0) ? getNoiseParams() : null;
     bakeSDFTexture(params.sdfResolution, smoothnessValue, noiseParams);
     // Also bake AO after SDF is ready
     bakeAOTexture(params.sdfResolution);
